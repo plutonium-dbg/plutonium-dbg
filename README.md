@@ -23,7 +23,7 @@ Follow the installation instructions at <a href=#setup>Setup</a> and start your 
 
 #### Standalone
 
-You can load the kernel module using `insmod plutonium-dbg.ko` or `modprobe ./plutonium-dbg.ko`. Once the module is loaded, you can communicate with the kernel module over IOCTL on `/dev/debugging`. When you are done with debugging, use `rmmod plutonium-dbg` or `modprobe -r plutonium-dbg` to unload the module.
+You can load the kernel module using `insmod plutonium-dbg.ko`. Once the module is loaded, you can communicate with the kernel module over IOCTL on `/dev/debugging`. When you are done with debugging, use `rmmod plutonium-dbg` to unload the module.
 
 To enable easier communication with the kernel module in Python, the `plutonium_dbg.py` module (in `clients`) abstracts the IOCTL calls and constants used:
 
