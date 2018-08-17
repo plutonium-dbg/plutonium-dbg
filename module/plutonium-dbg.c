@@ -150,7 +150,8 @@ static int check_access(pid_t target)
 	/* Check global ptrace capability */
 	flags = current->flags;
 	capable = ns_capable(t_cred->user_ns, CAP_SYS_PTRACE);
-	current->flags = flags; /* Restore flags, because ns_capable sets PF_SUPERPRIV */
+	if (!(flags & PF_SUPERPRIV))
+		current->flags &= ~PF_SUPERPRIV; /* ns_capable sets PF_SUPERPRIV, reset the state of that flag */
 
 	if (capable)
 		cleanup_and_return(0, put_task_struct(task));
