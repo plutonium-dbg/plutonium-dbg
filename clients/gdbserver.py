@@ -1,47 +1,45 @@
-#!/usr/bin/env python2
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 
-#     gdbserver.py - Use plutonium-dbg with GDB!
-#     Copyright (C) 2013 Axel "0vercl0k" Souchet - http://www.twitter.com/0vercl0k
-#     Copyright (C) 2018 Philipp "PhiK" Klocke, Tobias Holl
+#   gdbserver.py - Use plutonium-dbg with GDB!
+#   Copyright (C) 2018 Philipp "PhiK" Klocke, Tobias Holl
 #
-#     This program is free software: you can redistribute it and/or modify
-#     it under the terms of the GNU General Public License as published by
-#     the Free Software Foundation, either version 3 of the License, or
-#     (at your option) any later version.
+#   This program is free software; you can redistribute it and/or
+#   modify it under the terms of the GNU General Public License
+#   as published by the Free Software Foundation; either version 2
+#   of the License, or (at your option) any later version.
 #
-#     This program is distributed in the hope that it will be useful,
-#     but WITHOUT ANY WARRANTY; without even the implied warranty of
-#     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#     GNU General Public License for more details.
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
 #
-#     You should have received a copy of the GNU General Public License
-#     along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import division
-
-
-import sys
-import socket
-import logging
-import struct
-import subprocess
 import ctypes
 import errno
-import signal
-import os
+import logging
+import re
+import select
+import socket
+import struct
+import subprocess
+import sys
 
 from binascii import hexlify, unhexlify
-
 from plutonium_dbg import debugger
+from subprocess import check_output
 
+
+# globals
+# TODO create hierarchy/class-structure for encapsulation
 GDB_SIGNAL_TRAP = 5
-
 PACKET_SIZE = 4096
-
+log = None
+mod = debugger()
+tgid = 0
 
 class pt_regs(ctypes.Structure):
     _fields_ = [("r15",   ctypes.c_ulong),
@@ -73,352 +71,347 @@ class pt_regs(ctypes.Structure):
                 ("gs",    ctypes.c_ulong)]
 
 
+def try_ignore_eexist(f, *args):
+    try:
+        return f(*args)
+    except IOError as e:
+        if errno.EEXIST != e.errno:
+            raise
+    return None
+
+
 def checksum(data):
-    checksum = 0
-    for c in data:
-        checksum += ord(c)
-    return checksum & 0xff
+    """calculates checksum of data (as bytes)"""
+    return sum(data) & 0xff
 
 
-def unpack_thread(x):
-    if x == "-1":
-        return -1
-    # TODO easier way?
-    x = x.rjust(8, '0')
-    x = unhexlify(x)
-    x = struct.unpack('>I', x)[0]
-    return x
+def receive(conn):
+    """Receive a packet from a GDB client"""
 
-# Code a bit inspired from http://mspgcc.cvs.sourceforge.net/viewvc/mspgcc/msp430simu/gdbserver.py?revision=1.3&content-type=text%2Fplain
-class GDBClientHandler(object):
-    def __init__(self, clientsocket, tgid):
-        self.clientsocket = clientsocket
-        self.netin = clientsocket.makefile('r')
-        self.netout = clientsocket.makefile('w')
-        self.log = logging.getLogger('gdbclienthandler')
-        self.last_pkt = None
-        self.mod = debugger()
-        self.tgid = tgid
-        self.active_tid = self.tgid
+    # ready = select.select([conn], [], [], 0) # will never block
+    ready = select.select([conn], [], [], 1) # wait 1s
+    if len(ready[0]) == 0:
+        return b""
 
-    def close(self):
-        '''End of story!'''
-        self.netin.close()
-        self.netout.close()
-        self.clientsocket.close()
-        os.kill(self.tgid, signal.SIGTERM)
-        self.log.info('closed')
+    packet = conn.recv(PACKET_SIZE)
+    if packet != b'' and packet != b'+':
+        log.info("<- %r" % repr(packet))
+    return packet
 
-    def run(self):
-        '''Some doc about the available commands here:
-            * http://www.embecosm.com/appnotes/ean4/embecosm-howto-rsp-server-ean4-issue-2.html#id3081722
-            * http://git.qemu.org/?p=qemu.git;a=blob_plain;f=gdbstub.c;h=2b7f22b2d2b8c70af89954294fa069ebf23a5c54;hb=HEAD
-            * http://git.qemu.org/?p=qemu.git;a=blob_plain;f=target-i386/gdbstub.c;hb=HEAD'''
-        self.log.info('client loop ready...')
-        while self.receive() == 'Good':
-            pkt = self.last_pkt
-            self.log.debug('receive(%r)' % pkt)
-            # Each packet should be acknowledged with a single character. '+' to indicate satisfactory receipt
-            self.send_raw('+')
 
-            def handle_general_query(subcmd):
-                '''
-                subcmd Supported: https://sourceware.org/gdb/onlinedocs/gdb/General-Query-Packets.html#qSupported
-                Report the features supported by the RSP server. As a minimum, just the packet size can be reported.
-                '''
-                if subcmd.startswith('Supported'):
-                    self.log.info('Received qSupported command')
+def parse(packet):
+    # TODO: use ply or similar?
 
-                    def assert_support(x):
-                        if not x in subcmd:
-                            self.log.error("GDB Client does not support" + x + ". Aborting")
-                            os.kill(self.tgid, signal.SIGTERM)
-                            exit(0)
 
-                    assert_support('no-resumed')
-                    assert_support('swbreak')
+    # TODO: if first character is 'X', the $ and # might be from the payload.
+    # Since we do not handle 'X' packets yet, we can ignore this.
 
-                    self.send('PacketSize=%x;no-resumed+;swbreak+' % PACKET_SIZE)
-                    # TODO: support true multiprocessing including vCont
-                    # assert_support('multiprocess')
-                    # self.send('PacketSize=%x;no-resumed+;swbreak+;multiprocess+' % PACKET_SIZE)
-                elif subcmd.startswith('Attached'):
-                    # TODO: somwhere it said that it's not necessary to pause everything here, because gdb will do it on it's own.
-                    # for now we will just stick with it.
-                    # FIXME: this will break the protocol when we wait for too long until we reply back to gdb. Thus we'll need to write our own execve launcher.
-                    self.log.info('Received qAttached command')
-                    # https://sourceware.org/gdb/onlinedocs/gdb/General-Query-Packets.html
-                    self.mod.set_event_mask(self.tgid, self.mod.EVENT_SUSPEND) # Enable only suspend event
-                    self.mod.suspend_process(self.tgid)
-                    events = self.mod.wait()
-                    self.log.warning('wait() returned the following events: %s' % str(events))
-                    self.send('1')
-                elif subcmd.startswith('C'):
-                    self.send('T%.2x;' % self.active_tid)
-                elif subcmd.startswith('fThreadInfo'):
-                    self.log.info("Received fThreadInfo")
-                    threads = self.mod.enumerate_threads(self.tgid)
-                    self.log.info("Got the following threads " + repr(threads))
-                    answer = 'm' + ",".join([hexlify(struct.pack('>I', t)) for t in threads])
-                    if len(answer) > PACKET_SIZE:
-                        self.log.error("Answer is bigger than packet size\nWould need to implement splitting now!")
-                    self.log.info("Replying with " + answer)
-                    self.send(answer)
-                elif subcmd.startswith('sThreadInfo'):
-                    self.log.info("Received sThreadInfo, replying with End-Of-List")
-                    self.send("l") # TODO: for now just assume that we don't have to split packets.
-                elif subcmd.startswith('TStatus'):
-                    self.log.info("Received qTStatus command")
-                    self.send("T0;tnotrun:0") # we're not tracing anything. Probably we could ignore this package aswell
-                elif subcmd.startswith('ThreadExtraInfo'):
-                    self.log.info("Received qThreadExtraInfo command, replying with 'Unknown'")
-                    self.send(hexlify("Unknown"))
-                else:
-                    self.log.error('This subcommand %r is not implemented in q' % subcmd)
-                    self.send('')
+    if packet == b"":
+        return b""
 
-            def handle_stop_reason(subcmd):
-                """
-                Happens when GDB asks why we stopped. Just answer TRAP
-                """
-                # FIXME: keep track of all active events here
-                self.send('S%.2x' % GDB_SIGNAL_TRAP)
+    log.info("parsing " + repr(packet))
 
-            def handle_get_regs(subcmd):
-                if subcmd == '':
-                    s = self.mod.read_registers(self.tgid, 1)
-                    r = pt_regs()
-                    ctypes.memmove(ctypes.addressof(r), s, ctypes.sizeof(r))
-                    regs = [r.ax, r.bx, r.cx, r.dx, r.si, r.di, r.bp, r.sp, r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15, r.ip]
-                    eflags = r.flags
-                    segs = [r.cs, r.ss, r.ds, r.es, r.fs, r.gs]
-                    s = ''
-                    for reg in regs:
-                        s += hexlify(struct.pack('<Q', reg))
-                    s += hexlify(struct.pack('<L', eflags))
-                    for seg in segs:
-                        s += hexlify(struct.pack('<L', seg))
-                    self.send(s)
+    if packet == b'\x03':
+        return b"Ctrl+C"
 
-            def handle_mem_read(subcmd):
-                addr, size = subcmd.split(',')
-                addr = int(addr, 16)
-                size = int(size, 16)
-                # self.log.info('Received a "read memory" command (@%#.8x : %d bytes)' % (addr, size))
-                try:
-                    s = self.mod.read_memory(self.tgid, addr, size)
-                except IOError as e:
-                    self.send("E%02d" % e.errno)
-                    return
+    if packet == b'+':
+        return b""
 
-                self.send(hexlify(s))
+    if packet == b'-':
+        log.info("Received retransmit-request")
+        return b"-"
 
-            def handle_mem_write(subcmd):
-                """
-                This is not actually required but one of the nice-to-have features.
-                """
-                addr, _ = subcmd.split(',')
-                size, val = _.split(':')
-                addr = int(addr, 16)
-                size = int(size, 16)
-                val = unhexlify(val)
-                assert size == len(val)
-                self.log.info('Received a "write memory" command (@%#.8x : %d bytes : %s value)' % (addr, size, hexlify(val)))
-                self.mod.write_memory(self.tgid, addr, val)
-                self.send('OK')
-                # self.send("E01") if invalid. Actual Error Number is ignored
+    # TODO: this assumes no packet 'overlap'
+    _, packet = packet.split(b'$', 1)
+    data, chk = packet.split(b'#', 1)
 
-            def handle_single_step(subcmd):
-                """
-                Is this really necessary? Probably.
-                """
-                self.log.info('Received a "single step" command')
+    chk = int(chk[:2], 16)
 
-                try:
-                    self.mod.suspend_thread(self.tgid)
-                except IOError as e:
-                    if errno.EEXIST != e.errno:
-                        raise
+    if chk != checksum(data):
+        log.warning("Ignoring invalid checksum " + str(chk) + " for: " + str(data))
+        return b""
 
-                try:
-                    self.mod.thread_set_stepping(self.tgid, True)
-                except IOError as e:
-                    if errno.EEXIST != e.errno:
-                        raise
+    return data
 
-                self.mod.continue_thread(self.active_tid)
-                _do_wait(self.active_tid)
 
-            def handle_breakpoint_set(subcmd):
-                num, addr, stuff = subcmd.split(',')
-                num = int(num, 16)
-                addr = int(addr, 16)
-                stuff = int(stuff, 16)
-                self.log.info('Received a "set breakpoint" command (%d : @%#.8x : %d)' % (num, addr, stuff))
-                if num == 0: # 0 is software breakpoint
-                    self.mod.install_breakpoint(self.tgid, addr)
-                    self.send('OK')
-                else:
-                    self.log.error('Error: Breakpoint type %d not supported!' % num)
-                    self.send('E01')
+def send(conn, msg):
+    """Send a packet to the GDB client
+    msg has to be string
+    """
+    msg_b = msg.encode('ascii')
+    # TODO: handle escaping properly here
+    if b'$' in msg_b or b'#' in msg_b:
+        log.error('Can not send ' + msg + ' due to lack of encoding of special characters')
+        return
+    chk = hex(checksum(msg_b))[2:].rjust(2, "0").encode('ascii')
+    send_raw(conn, b'$' + msg_b + b'#' + chk)
 
-            def handle_breakpoint_remove(subcmd):
-                num, addr, stuff = subcmd.split(',')
-                num = int(num, 16) # use?
-                addr = int(addr, 16)
-                stuff = int(stuff, 16) # use?
-                self.log.info('Received a "remove breakpoint" command (%d : @%#.8x : %d)' % (num, addr, stuff))
-                if num == 0: # 0 is software breakpoint
-                    self.mod.remove_breakpoint(self.tgid, addr)
-                    self.send('OK')
-                else:
-                    self.log.error('Error: Breakpoint type %d not supported!' % num)
-                    self.send('E01')
 
-            def handle_continue(subcmd):
-                self.log.info('Received a "continue" command')
-                try:
-                    self.mod.thread_set_stepping(self.active_tid, False)
-                except IOError as e:
-                    if e.errno != errno.ENOENT:
-                        raise
-                self.mod.continue_thread(self.active_tid)
-                _do_wait()
+def send_raw(conn, msg):
+    if msg != '+':
+        log.info('-> %r' % repr(msg))
+    conn.sendall(msg)
 
-            def handle_set_thread(subcmd):
-                print(subcmd)
-                op = subcmd[0]
-                tid = unpack_thread(subcmd[1:])
-                self.log.info("Received a set-thread packet for thread %d and operation %c" % (tid, op))
-                self.log.warning("Ignoring op parameter")
-                if tid == -1:
-                    # -1 = all threads
-                    self.log.warning("Assuming -1 means just tgid")
-                    tid = self.tgid
-                if tid == 0:
-                    # 0 = arbitrary process/thread
-                    self.log.info("Using tgid as arbitrary process id")
-                    tid = self.tgid
-                self.active_tid = tid
-                self.send('OK')
 
-            def handle_thread_alive(subcmd):
-                # TODO: workaround, maybe the tid is already taken by another thread
-                threads = self.mod.enumerate_threads(self.tgid)
-                if unpack_thread(subcmd) in threads:
-                    self.send("OK")
-                else:
-                    self.send("E01") # whatever error
+def _query(request):
+    if request.startswith('Supported'):
+        return _q_supported(request)
+    if request.startswith('Attached'):
+        for t in mod.enumerate_threads(tgid):
+           mod.suspend_thread(t)
+        return '1' # to indicate that we attached to a running process
+    if request == 'C':
+        return 'QC' + hex(tgid)[2:]
+    return ""
 
-            def _do_wait(tid=None):
-                if tid is None:
-                    events = self.mod.wait()
-                else:
-                    events = self.mod.wait_for(tid)
-                self.log.warning('wait_for(%d) returned the following events: %s' % (self.tgid, str(events)))
-                for evt in events:
-                    if evt['event'] == self.mod.EVENT_EXIT:
-                        if evt['victim'] == self.tgid:
-                            self.send('W%.2x' % evt['data']) # signal process exit.
-                            return
-                        else:
-                            pass # we mustn't send the w packet (thread exit) immediately, GDB will ask for it.
-                first_stop = (e for e in events if lambda x: x['event'] == self.mod.EVENT_SUSPEND).next()
-                if first_stop is None:
-                    # what happened here? We got woken up, but no-one hit a breakpoint. So what now??
-                    # self.send('N') # no running thread is left alive
-                    self.log.error("No idea how to handle this wake-up. Everything from here on could be wrong!")
-                    self.send('O%s' % hexlify("Got woken up and don't know why. Everything from here on could be wrong!"))
-                    self.send('N')
-                else:
-                    self.send('T%.2xthread:%s;swbreak:;' % (GDB_SIGNAL_TRAP, hexlify(struct.pack('>I', first_stop['victim'])))) # signal that we reached a breakpoint
 
-            dispatchers = {
-                'q' : handle_general_query,
-                '?' : handle_stop_reason,
-                'g' : handle_get_regs,
-                'm' : handle_mem_read,
-                'M' : handle_mem_write,
-                's' : handle_single_step,
-                'Z' : handle_breakpoint_set,
-                'z' : handle_breakpoint_remove,
-                'c' : handle_continue,
-                'H' : handle_set_thread,
-                'T' : handle_thread_alive,
-            }
+def _q_supported(request):
+    def assert_support(x):
+        if not x in request:
+            log.error("GDB Client does not support" + x + ". Aborting")
+            os.kill(tgid, signal.SIGKILL)
+            exit(0)
 
-            cmd, subcmd = pkt[0], pkt[1 :]
-            if cmd == 'k':
-                break
+    supported = ['no-resumed+', 'swbreak+']
+    for x in supported:
+        assert_support(x)
+    return 'PacketSize=%x;' % PACKET_SIZE + ';'.join(supported)
 
-            if cmd not in dispatchers:
-                self.log.warning('%r command not handled' % pkt)
-                self.send('')
+
+def _memory_read(request):
+    # we don't need to loop over tid's here, since threads share memory space anyways.
+    addr, size = request.split(',')
+    addr = int(addr, 16)
+    size = int(size, 16)
+    log.info('Received a "read memory" command (@%#.8x : %d bytes)' % (addr, size))
+
+    try:
+        s = mod.read_memory(tgid, addr, size)
+    except IOError as e:
+        return "E%02d" % e.errno
+
+    return hexlify(s).decode('ascii')
+
+
+def _memory_write(request):
+    addr, _ = request.split(',')
+    size, val = _.split(':')
+    addr = int(addr, 16)
+    size = int(size, 16)
+    val = unhexlify(val)
+    assert size == len(val)
+    log.info('Received a "write memory" command (@%#.8x : %d bytes : %s value)' % (addr, size, hexlify(val)))
+    mod.write_memory(tgid, addr, val)
+    return 'OK'
+
+
+def _breakpoint_set(request):
+    num, addr, stuff = request.split(',')
+    if num != '0':
+        log.error("Can't handle breakpoint type: " + num)
+        return 'E01'
+    num = int(num, 16)
+    addr = int(addr, 16)
+    stuff = int(stuff, 16) # use?
+    log.info('Received a "set breakpoint" command (%d : @%#.8x : %d)' % (num, addr, stuff))
+    mod.install_breakpoint(tgid, addr)
+    return 'OK'
+
+
+def _breakpoint_unset(request):
+    num, addr, stuff = request.split(',')
+    if num != '0':
+        log.error("Can't handle breakpoint type: " + num)
+        return 'E01'
+    num = int(num, 16)
+    addr = int(addr, 16)
+    stuff = int(stuff, 16) # use?
+    log.info('Received a "remove breakpoint" command (%d : @%#.8x : %d)' % (num, addr, stuff))
+    mod.remove_breakpoint(tgid, addr)
+    return 'OK'
+
+
+def _single_step(request):
+    log.info('Received a "single step" command')
+    for tid in get_active_tids('s'):
+        try_ignore_eexist(mod.suspend_thread, tid)
+        try_ignore_eexist(mod.thread_set_stepping, tid, True)
+        mod.continue_thread(tid)
+    return None
+
+
+def _continue(request):
+    log.info('Received a "continue" command')
+    for tid in get_active_tids('c'):
+        try:
+            try_ignore_eexist(mod.thread_set_stepping, tid, False)
+        except IOError as e:
+            if errno.ENOENT != e.errno:
+                raise
+        mod.continue_thread(tid)
+    return None
+
+
+def _thread_alive(request):
+    # TODO: workaround, maybe the tid is already taken by another thread
+    threads = mod.enumerate_threads(tgid)
+    if int(request, 16) in threads:
+        return "OK"
+    else:
+        return "E01" # whatever error
+
+
+def _registers_read(request):
+    ret = b''
+    for tid in get_active_tids('g'):
+        s = mod.read_registers(tid, 1)
+        r = pt_regs()
+        ctypes.memmove(ctypes.addressof(r), s, ctypes.sizeof(r))
+        regs = [r.ax, r.bx, r.cx, r.dx, r.si, r.di, r.bp, r.sp, r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15, r.ip]
+        eflags = r.flags
+        segs = [r.cs, r.ss, r.ds, r.es, r.fs, r.gs]
+        s = b''
+        for reg in regs:
+            s += hexlify(struct.pack('<Q', reg))
+        s += hexlify(struct.pack('<L', eflags))
+        for seg in segs:
+            s += hexlify(struct.pack('<L', seg))
+        ret += s
+    return ret.decode('ascii')
+
+
+def _stop_reason(request):
+    # FIXME for now just send trap-signal.
+    # actually the events have to be handled here
+    return 'S%.2x' % GDB_SIGNAL_TRAP
+
+
+active_tids = {}
+
+def _thread_set(request):
+    global active_tids
+
+    affected_op = request[0]
+    tid = int(request[1:], 16)
+    log.info("Received a set-thread packet for thread %d and operation %c" % (tid, affected_op))
+    if tid == -1:
+        # -1 = all threads
+        log.info("tgid = " + repr(tgid))
+        active_tids[affected_op] = mod.enumerate_threads(tgid)
+        return 'OK'
+    elif tid == 0:
+        # 0 = arbitrary process/thread
+        log.info("Using tgid as arbitrary process id")
+        tid = tgid
+    active_tids[affected_op] = [tid]
+    return 'OK'
+
+
+def get_active_tids(op_type):
+    """returns tids that the op_type operation should affect"""
+    global active_tids
+    if op_type in active_tids:
+        return active_tids[op_type]
+    return [tgid]
+
+
+handlers = {
+    'q' : _query,
+    'm' : _memory_read,
+    'M' : _memory_write,
+    'z' : _breakpoint_unset,
+    'Z' : _breakpoint_set,
+    'g' : _registers_read,
+#   'G' : _registers_write,
+    '?' : _stop_reason,
+    's' : _single_step,
+    'c' : _continue,
+    'T' : _thread_alive,
+    'H' : _thread_set
+}
+
+
+def main_loop(conn):
+    events = []
+    last_packet = ""
+    while True:
+        # handle packets
+        packet = parse(receive(conn)).decode('ascii')
+        if packet == "-":
+            log.info('Resending last packet')
+            send(conn, last_packet)
+            continue
+        if packet != "":
+            send_raw(conn, b'+')
+            if(packet == "Ctrl+C"):
+                mod.suspend_process(tgid)
                 continue
-
-            dispatchers[cmd](subcmd)
-
-        self.close()
-
-    def receive(self):
-        '''Receive a packet from a GDB client'''
-        # XXX: handle the escaping stuff '}' & (n^0x20)
-        csum = 0
-        state = 'Finding SOP'
-        packet = ''
-        while True:
-            c = self.netin.read(1)
-            if c == '\x03':
-                return 'Error: CTRL+C'
-
-            if len(c) != 1:
-                return 'Error: EOF'
-
-            if state == 'Finding SOP':
-                if c == '$':
-                    state = 'Finding EOP'
-            elif state == 'Finding EOP':
-                if c == '#':
-                    if csum != int(self.netin.read(2), 16):
-                        raise Exception('invalid checksum')
-                    self.last_pkt = packet
-                    return 'Good'
+            command, data = packet[0], packet[1:]
+            try:
+                if command in handlers.keys():
+                    response = handlers[command](data)
+                    if response is None:
+                        continue # rather continue with handle events, needs slight refactoring
+                    send(conn, response)
+                    last_packet = response
                 else:
-                    packet += c
-                    csum = (csum + ord(c)) & 0xff
+                    log.debug('Ignoring packet due to missing handler for ' + command)
+                    send(conn, "")
+                    last_packet = ""
+            except KeyboardInterrupt:
+                send(conn, 'E01')
+                last_packet = 'E01'
+
+        # handle events
+        events.extend(mod.events())
+        handled_events = []
+        for event in events:
+            if event['event'] == mod.EVENT_SUSPEND:
+                if event['data'] == 2 or event['data'] == 3:
+                    send(conn, 'T' + str(GDB_SIGNAL_TRAP).rjust(2, '0') + 'thread:' + hex(event['victim'])[2:] + ';')
+                else:
+                    send(conn, 'S01')
+                handled_events.append(event)
+            elif event['event'] == mod.EVENT_EXIT:
+                # TODO: handle this appropriately
+                pass
             else:
-                raise Exception('should not be here')
-
-    def send(self, msg):
-        '''Send a packet to the GDB client'''
-        self.log.debug('send(%r)' % msg)
-        self.send_raw('$%s#%.2x' % (msg, checksum(msg)))
-
-    def send_raw(self, r):
-        self.netout.write(r)
-        self.netout.flush()
+                log.info('Not handling event: ' + repr(event))
+                handled_events.append(event)
+        events = [e for e in events if not e in handled_events]
 
 
 def main(program_args):
+    global log
+    global tgid
 
-    logging.basicConfig(level = logging.WARN)
-    for logger in 'gdbclienthandler runner main'.split(' '):
-        logging.getLogger(logger).setLevel(level = logging.INFO)
+    logging.basicConfig(level = logging.DEBUG)
+    log = logging.getLogger('')
 
-    log = logging.getLogger('main')
     port = 31337
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('', port))
 
+    # TODO: startup script
     tgid = subprocess.Popen(program_args).pid
 
     log.info('listening on :%d' % port)
     sock.listen(1)
     conn, addr = sock.accept()
+    conn.setblocking(0)
     log.info('connected')
 
-    GDBClientHandler(conn, tgid).run()
+    try:
+        main_loop(conn)
+    finally:
+        conn.close()
+        sock.close()
 
 
-if __name__ == '__main__':
-    main(sys.argv[1:])
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Not enough arguments!")
+        print("Usage: gdbserver.py victim-program")
+
+    main("".join(sys.argv[1:]))
