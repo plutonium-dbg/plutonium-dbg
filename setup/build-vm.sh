@@ -83,7 +83,7 @@ EOF
 cat > "$ROOT/ssh.sh" << EOF
 #!/bin/sh
 VMPATH="\$(dirname "\$(readlink -f "\$0")")"
-ssh -i "$VMPATH/id_rsa" -p 20022 -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" root@localhost
+ssh -i "\$VMPATH/id_rsa" -p 20022 -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" root@localhost
 EOF
 
 cat > "$ROOT/scp.sh" << EOF
@@ -91,7 +91,7 @@ cat > "$ROOT/scp.sh" << EOF
 VMPATH="\$(dirname "\$(readlink -f "\$0")")"
 FILES=\${@:1:\$#-1}
 TARGET=\${@:\$#}
-scp -i "$VMPATH/id_rsa" -P 20022 -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" \$FILES "root@localhost:\$TARGET"
+scp -i "\$VMPATH/id_rsa" -P 20022 -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" \$FILES "root@localhost:\$TARGET"
 EOF
 
 chmod a+x "$ROOT/run.sh" "$ROOT/ssh.sh" "$ROOT/scp.sh"
