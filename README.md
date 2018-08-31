@@ -78,9 +78,7 @@ Contributions to plutonium-dbg are always welcome! If you encounter a bug or hav
 
 ## License
 
-plutonium-dbg is released under the GPLv2 (or, at your choice, any later version).
-
-The GDB server, pending a rewrite, is licensed under GPLv3.
+plutonium-dbg, including the GDB server, is released under the GPLv2 (or, at your choice, any later version).
 
 ----
 
