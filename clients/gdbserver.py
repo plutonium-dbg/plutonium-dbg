@@ -23,10 +23,13 @@ import errno
 import logging
 import re
 import select
+import signal
 import socket
 import struct
 import subprocess
 import sys
+import time
+import os
 
 from binascii import hexlify, unhexlify
 from plutonium_dbg import debugger
@@ -157,8 +160,9 @@ def _query(request):
     if request.startswith('Supported'):
         return _q_supported(request)
     if request.startswith('Attached'):
-        for t in mod.enumerate_threads(tgid):
-           mod.suspend_thread(t)
+        # not necessary when using launcher, since victim is already suspended
+        # for t in mod.enumerate_threads(tgid):
+        #   mod.suspend_thread(t)
         return '1' # to indicate that we attached to a running process
     if request == 'C':
         return 'QC' + hex(tgid)[2:]
@@ -393,8 +397,12 @@ def main(program_args):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('', port))
 
-    # TODO: startup script
-    tgid = subprocess.Popen(program_args).pid
+    tgid = subprocess.Popen(["./launch", program_args]).pid
+    mod.set_event_mask(tgid, mod.EVENT_EXEC)
+    time.sleep(1) # TODO: get feedback from launch program
+    os.kill(tgid, signal.SIGUSR1) # signal that we're set up
+    mod.wait() # wait for exec event
+    mod.set_event_mask(tgid, mod.EVENT_SUSPEND)
 
     log.info('listening on :%d' % port)
     sock.listen(1)
@@ -413,5 +421,6 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Not enough arguments!")
         print("Usage: gdbserver.py victim-program")
+        exit(-1)
 
     main("".join(sys.argv[1:]))
