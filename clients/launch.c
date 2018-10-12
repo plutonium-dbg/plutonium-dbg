@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <unistd.h>
 
-sig_atomic_t received_signal = 0;
+volatile sig_atomic_t received_signal = 0;
 
-void handle_sigusr1(int signal)
+static void handle_sigusr1(int signal)
 {
     received_signal = (signal == SIGUSR1);
 }
@@ -25,5 +25,5 @@ int main(int argc, char *argv[], char *envp[])
     while (!received_signal) usleep(50000);
 
     // Launch target
-	execvpe(argv[1], &argv[1], envp);
+    execvpe(argv[1], &argv[1], envp);
 }
