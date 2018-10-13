@@ -1,0 +1,589 @@
+diff --git a/include/linux/uprobes.h b/include/linux/uprobes.h
+index 0a294e950df8..930bea8f28ef 100644
+--- a/include/linux/uprobes.h
++++ b/include/linux/uprobes.h
+@@ -123,8 +123,10 @@ extern unsigned long uprobe_get_swbp_addr(struct pt_regs *regs);
+ extern unsigned long uprobe_get_trap_addr(struct pt_regs *regs);
+ extern int uprobe_write_opcode(struct mm_struct *mm, unsigned long vaddr, uprobe_opcode_t);
+ extern int uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *uc);
++extern int uprobe_register_anonymous(struct mm_struct *mm, unsigned long vaddr, struct uprobe_consumer *uc);
+ extern int uprobe_apply(struct inode *inode, loff_t offset, struct uprobe_consumer *uc, bool);
+ extern void uprobe_unregister(struct inode *inode, loff_t offset, struct uprobe_consumer *uc);
++extern void uprobe_unregister_anonymous(struct mm_struct *mm, unsigned long vaddr, struct uprobe_consumer *uc);
+ extern int uprobe_mmap(struct vm_area_struct *vma);
+ extern void uprobe_munmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+ extern void uprobe_start_dup_mmap(void);
+@@ -161,6 +163,11 @@ uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *uc)
+ 	return -ENOSYS;
+ }
+ static inline int
++uprobe_register_anonymous(struct mm_struct *mm, unsigned long vaddr, struct uprobe_consumer *uc)
++{
++	return -ENOSYS;
++}
++static inline int
+ uprobe_apply(struct inode *inode, loff_t offset, struct uprobe_consumer *uc, bool add)
+ {
+ 	return -ENOSYS;
+@@ -169,6 +176,10 @@ static inline void
+ uprobe_unregister(struct inode *inode, loff_t offset, struct uprobe_consumer *uc)
+ {
+ }
++static inline void
++uprobe_unregister_anonymous(struct mm_struct *mm, unsigned long vaddr, struct uprobe_consumer *uc)
++{
++}
+ static inline int uprobe_mmap(struct vm_area_struct *vma)
+ {
+ 	return 0;
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index ce6848e46e94..ba56cf6aac79 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -63,6 +63,7 @@ static struct percpu_rw_semaphore dup_mmap_sem;
+ 
+ /* Have a copy of original instruction */
+ #define UPROBE_COPY_INSN	0
++#define UPROBE_ANONYMOUS	1
+ 
+ struct uprobe {
+ 	struct rb_node		rb_node;	/* node in the rb tree */
+@@ -71,8 +72,16 @@ struct uprobe {
+ 	struct rw_semaphore	consumer_rwsem;
+ 	struct list_head	pending_list;
+ 	struct uprobe_consumer	*consumers;
+-	struct inode		*inode;		/* Also hold a ref to inode */
+-	loff_t			offset;
++	union {
++		struct {				/* Normal uprobes */
++			struct inode		*inode;	/* Also hold a ref to inode */
++			loff_t			offset;
++		};
++		struct {				/* Anonymous uprobes (no inode) */
++			struct mm_struct	*mm;	/* Exactly one mm_struct has this probe */
++			unsigned long		vaddr;
++		};
++	};
+ 	unsigned long		flags;
+ 
+ 	/*
+@@ -127,7 +136,7 @@ static bool valid_vma(struct vm_area_struct *vma, bool is_register)
+ 	if (is_register)
+ 		flags |= VM_WRITE;
+ 
+-	return vma->vm_file && (vma->vm_flags & flags) == VM_MAYEXEC;
++	return (vma->vm_flags & flags) == VM_MAYEXEC;
+ }
+ 
+ static unsigned long offset_to_vaddr(struct vm_area_struct *vma, loff_t offset)
+@@ -383,17 +392,37 @@ static void put_uprobe(struct uprobe *uprobe)
+ 
+ static int match_uprobe(struct uprobe *l, struct uprobe *r)
+ {
+-	if (l->inode < r->inode)
++	if (test_bit(UPROBE_ANONYMOUS, &l->flags) < test_bit(UPROBE_ANONYMOUS, &r->flags))
+ 		return -1;
+ 
+-	if (l->inode > r->inode)
++	if (test_bit(UPROBE_ANONYMOUS, &l->flags) > test_bit(UPROBE_ANONYMOUS, &r->flags))
+ 		return 1;
+ 
+-	if (l->offset < r->offset)
+-		return -1;
++	if (test_bit(UPROBE_ANONYMOUS, &l->flags)) {
++		if (l->mm < r->mm)
++			return -1;
+ 
+-	if (l->offset > r->offset)
+-		return 1;
++		if (l->mm > r->mm)
++			return 1;
++
++		if (l->vaddr < r->vaddr)
++			return -1;
++
++		if (l->vaddr > r->vaddr)
++			return 1;
++	} else {
++		if (l->inode < r->inode)
++			return -1;
++
++		if (l->inode > r->inode)
++			return 1;
++
++		if (l->offset < r->offset)
++			return -1;
++
++		if (l->offset > r->offset)
++			return 1;
++	}
+ 
+ 	return 0;
+ }
+@@ -419,6 +448,28 @@ static struct uprobe *__find_uprobe(struct inode *inode, loff_t offset)
+ 	return NULL;
+ }
+ 
++static struct uprobe *__find_anonymous_uprobe(struct mm_struct *mm, unsigned long vaddr)
++{
++	struct uprobe u = { .mm = mm, .vaddr = vaddr };
++	set_bit(UPROBE_ANONYMOUS, &u.flags);
++	struct rb_node *n = uprobes_tree.rb_node;
++	struct uprobe *uprobe;
++	int match;
++
++	while (n) {
++		uprobe = rb_entry(n, struct uprobe, rb_node);
++		match = match_uprobe(&u, uprobe);
++		if (!match)
++			return get_uprobe(uprobe);
++
++		if (match < 0)
++			n = n->rb_left;
++		else
++			n = n->rb_right;
++	}
++	return NULL;
++}
++
+ /*
+  * Find a uprobe corresponding to a given inode:offset
+  * Acquires uprobes_treelock
+@@ -434,6 +485,21 @@ static struct uprobe *find_uprobe(struct inode *inode, loff_t offset)
+ 	return uprobe;
+ }
+ 
++/*
++ * Find an anonymous uprobe corresponding to the given tgid:address
++ * Acquires uprobes_treelock
++ */
++static struct uprobe *find_anonymous_uprobe(struct mm_struct *mm, unsigned long vaddr)
++{
++	struct uprobe *uprobe;
++
++	spin_lock(&uprobes_treelock);
++	uprobe = __find_anonymous_uprobe(mm, vaddr);
++	spin_unlock(&uprobes_treelock);
++
++	return uprobe;
++}
++
+ static struct uprobe *__insert_uprobe(struct uprobe *uprobe)
+ {
+ 	struct rb_node **p = &uprobes_tree.rb_node;
+@@ -508,6 +574,33 @@ static struct uprobe *alloc_uprobe(struct inode *inode, loff_t offset)
+ 	return uprobe;
+ }
+ 
++static struct uprobe *alloc_anonymous_uprobe(struct mm_struct *mm, unsigned long vaddr)
++{
++	struct uprobe *uprobe, *cur_uprobe;
++
++	uprobe = kzalloc(sizeof(struct uprobe), GFP_KERNEL);
++	if (!uprobe)
++		return NULL;
++
++	mmgrab(mm);
++	uprobe->mm = mm;
++	uprobe->vaddr = vaddr;
++	set_bit(UPROBE_ANONYMOUS, &uprobe->flags);
++	init_rwsem(&uprobe->register_rwsem);
++	init_rwsem(&uprobe->consumer_rwsem);
++
++	/* add to uprobes_tree */
++	cur_uprobe = insert_uprobe(uprobe);
++	/* a uprobe already exists at this location */
++	if (cur_uprobe) {
++		kfree(uprobe);
++		uprobe = cur_uprobe;
++		mmdrop(mm);
++	}
++
++	return uprobe;
++}
++
+ static void consumer_add(struct uprobe *uprobe, struct uprobe_consumer *uc)
+ {
+ 	down_write(&uprobe->consumer_rwsem);
+@@ -587,6 +680,54 @@ static int copy_insn(struct uprobe *uprobe, struct file *filp)
+ 	return err;
+ }
+ 
++static int copy_insn_anonymous(struct uprobe *uprobe, struct mm_struct *mm,
++				unsigned long vaddr)
++{
++	char *insn = (char *) uprobe->arch.insn;
++	int size = sizeof(uprobe->arch.insn);
++
++	/* We should return access_remote_vm(mm, vaddr, insn, size, FOLL_FORCE);
++	 * but we already hold the lock on mm->mmap_sem either from uprobe_mmap
++	 * or from register_for_each_vma, which would lead to a deadlock.
++	 * Therefore, we have to replicate its reading functionality here. */
++
++	while (size) {
++		int bytes, ret, offset;
++		struct vm_area_struct *vma;
++		struct page *page = NULL;
++		void *mapped;
++
++		ret = get_user_pages_remote(NULL, mm, vaddr, 1, FOLL_FORCE, &page, &vma, NULL);
++		if (ret <= 0) {
++#ifndef CONFIG_HAVE_IOREMAP_PROT
++			break;
++#else
++			vma = find_vma(mm, vaddr);
++			if (!vma || vma->vm_start > vaddr)
++				break;
++			if (vma->vm_ops && vma->vm_ops->access)
++				ret = vma->vm_ops->access(vma, vaddr, insn, size, false);
++			if (ret <= 0)
++				break;
++			bytes = ret;
++#endif
++		} else {
++			offset = vaddr & ~PAGE_MASK;
++			bytes = min_t(int, size, PAGE_SIZE - offset);
++
++			mapped = kmap(page);
++			copy_from_user_page(vma, page, vaddr, insn, mapped + offset, bytes);
++			kunmap(page);
++			put_page(page);
++		}
++		size -= bytes;
++		insn += bytes;
++		vaddr += bytes;
++	}
++
++	return (insn - (char *) uprobe->arch.insn) != sizeof(uprobe->arch.insn);
++}
++
+ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
+ 				struct mm_struct *mm, unsigned long vaddr)
+ {
+@@ -600,7 +741,10 @@ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
+ 	if (test_bit(UPROBE_COPY_INSN, &uprobe->flags))
+ 		goto out;
+ 
+-	ret = copy_insn(uprobe, file);
++	if (test_bit(UPROBE_ANONYMOUS, &uprobe->flags))
++		ret = copy_insn_anonymous(uprobe, mm, vaddr);
++	else
++		ret = copy_insn(uprobe, file);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -613,8 +757,12 @@ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
+ 		goto out;
+ 
+ 	/* uprobe_write_opcode() assumes we don't cross page boundary */
+-	BUG_ON((uprobe->offset & ~PAGE_MASK) +
+-			UPROBE_SWBP_INSN_SIZE > PAGE_SIZE);
++	unsigned long page_offset;
++	if (test_bit(UPROBE_ANONYMOUS, &uprobe->flags))
++		page_offset = uprobe->vaddr & ~PAGE_MASK;
++	else
++		page_offset = uprobe->offset & ~PAGE_MASK;
++	BUG_ON(page_offset + UPROBE_SWBP_INSN_SIZE > PAGE_SIZE);
+ 
+ 	smp_wmb(); /* pairs with rmb() in find_active_uprobe() */
+ 	set_bit(UPROBE_COPY_INSN, &uprobe->flags);
+@@ -701,7 +849,10 @@ static void delete_uprobe(struct uprobe *uprobe)
+ 	rb_erase(&uprobe->rb_node, &uprobes_tree);
+ 	spin_unlock(&uprobes_treelock);
+ 	RB_CLEAR_NODE(&uprobe->rb_node); /* for uprobe_is_active() */
+-	iput(uprobe->inode);
++	if (test_bit(UPROBE_ANONYMOUS, &uprobe->flags))
++		mmdrop(uprobe->mm);
++	else
++		iput(uprobe->inode);
+ 	put_uprobe(uprobe);
+ }
+ 
+@@ -795,6 +946,31 @@ register_for_each_vma(struct uprobe *uprobe, struct uprobe_consumer *new)
+ 	struct map_info *info;
+ 	int err = 0;
+ 
++	if (test_bit(UPROBE_ANONYMOUS, &uprobe->flags)) {
++		/* We have no inode to check the mapping of. */
++		struct mm_struct *mm = uprobe->mm;
++		struct vm_area_struct *vma;
++
++		down_write(&mm->mmap_sem);
++		vma = find_vma(mm, uprobe->vaddr);
++		if (!vma || !valid_vma(vma, is_register))
++			goto anon_unlock;
++		if (vma->vm_start > uprobe->vaddr)
++			goto anon_unlock;
++
++		if (is_register) {
++			if (consumer_filter(new, UPROBE_FILTER_REGISTER, mm))
++				err = install_breakpoint(uprobe, mm, vma, uprobe->vaddr);
++		} else if (test_bit(MMF_HAS_UPROBES, &mm->flags)) {
++			if (!filter_chain(uprobe, UPROBE_FILTER_UNREGISTER, mm))
++				err = remove_breakpoint(uprobe, mm, uprobe->vaddr);
++		}
++
++anon_unlock:
++		up_write(&mm->mmap_sem);
++		goto out;
++	}
++
+ 	percpu_down_write(&dup_mmap_sem);
+ 	info = build_map_info(uprobe->inode->i_mapping,
+ 					uprobe->offset, is_register);
+@@ -861,7 +1037,7 @@ static void __uprobe_unregister(struct uprobe *uprobe, struct uprobe_consumer *u
+ 		delete_uprobe(uprobe);
+ }
+ 
+-/*
++/**
+  * uprobe_register - register a probe
+  * @inode: the file in which the probe has to be placed.
+  * @offset: offset from the start of the file.
+@@ -918,6 +1094,56 @@ int uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *
+ }
+ EXPORT_SYMBOL_GPL(uprobe_register);
+ 
++/**
++ * uprobe_register_anonymous - register an anonymous probe
++ * @mm: address space in which to place the probe.
++ * @vaddr: address of the probed instruction.
++ * @uc: information on how to handle the probe.
++ *
++ * Apart from the access refcount, uprobe_register*() takes a creation
++ * refcount (through alloc_uprobe) if and only if this @uprobe is getting
++ * inserted into the rbtree (i.e first consumer for the probe).
++ * Creation refcount stops uprobe_unregister from freeing the
++ * @uprobe even before the register operation is complete. Creation
++ * refcount is released when the last @uc for the @uprobe
++ * unregisters.
++ *
++ * Return errno if it cannot successully install probes
++ * else return 0 (success)
++ */
++int uprobe_register_anonymous(struct mm_struct *mm, unsigned long vaddr, struct uprobe_consumer *uc)
++{
++	struct uprobe *uprobe;
++	int ret;
++
++	/* Uprobe must have at least one set consumer */
++	if (!uc->handler && !uc->ret_handler)
++		return -EINVAL;
++
++ retry:
++	uprobe = alloc_anonymous_uprobe(mm, vaddr);
++	if (!uprobe)
++		return -ENOMEM;
++	/*
++	 * We can race with uprobe_unregister()->delete_uprobe().
++	 * Check uprobe_is_active() and retry if it is false.
++	 */
++	down_write(&uprobe->register_rwsem);
++	ret = -EAGAIN;
++	if (likely(uprobe_is_active(uprobe))) {
++		ret = __uprobe_register(uprobe, uc);
++		if (ret)
++			__uprobe_unregister(uprobe, uc);
++	}
++	up_write(&uprobe->register_rwsem);
++	put_uprobe(uprobe);
++
++	if (unlikely(ret == -EAGAIN))
++		goto retry;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(uprobe_register_anonymous);
++
+ /*
+  * uprobe_apply - unregister a already registered probe.
+  * @inode: the file in which the probe has to be removed.
+@@ -947,7 +1173,7 @@ int uprobe_apply(struct inode *inode, loff_t offset,
+ 	return ret;
+ }
+ 
+-/*
++/**
+  * uprobe_unregister - unregister a already registered probe.
+  * @inode: the file in which the probe has to be removed.
+  * @offset: offset from the start of the file.
+@@ -968,29 +1194,54 @@ void uprobe_unregister(struct inode *inode, loff_t offset, struct uprobe_consume
+ }
+ EXPORT_SYMBOL_GPL(uprobe_unregister);
+ 
+-static int unapply_uprobe(struct uprobe *uprobe, struct mm_struct *mm)
++/**
++ * uprobe_unregister_anonymous - unregister a register anonymous probe
++ * @mm: the &struct mm_struct to remove the probe from.
++ * @vaddr: the address of the probe in @mm.
++ * @uc: identity of the probe if multiple probes are colocated
++ */
++void uprobe_unregister_anonymous(struct mm_struct *mm, unsigned long vaddr, struct uprobe_consumer *uc)
+ {
+-	struct vm_area_struct *vma;
+-	int err = 0;
++	struct uprobe *uprobe;
+ 
+-	down_read(&mm->mmap_sem);
+-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+-		unsigned long vaddr;
+-		loff_t offset;
++	uprobe = find_anonymous_uprobe(mm, vaddr);
++	if (WARN_ON(!uprobe))
++		return;
+ 
+-		if (!valid_vma(vma, false) ||
+-		    file_inode(vma->vm_file) != uprobe->inode)
+-			continue;
++	down_write(&uprobe->register_rwsem);
++	__uprobe_unregister(uprobe, uc);
++	up_write(&uprobe->register_rwsem);
++	put_uprobe(uprobe);
++}
++EXPORT_SYMBOL_GPL(uprobe_unregister_anonymous);
+ 
+-		offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
+-		if (uprobe->offset <  offset ||
+-		    uprobe->offset >= offset + vma->vm_end - vma->vm_start)
+-			continue;
++static int unapply_uprobe(struct uprobe *uprobe, struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++	int err = 0;
+ 
+-		vaddr = offset_to_vaddr(vma, uprobe->offset);
+-		err |= remove_breakpoint(uprobe, mm, vaddr);
++	if (test_bit(UPROBE_ANONYMOUS, &uprobe->flags)) {
++		err |= remove_breakpoint(uprobe, mm, uprobe->vaddr);
++	} else {
++		down_read(&mm->mmap_sem);
++		for (vma = mm->mmap; vma; vma = vma->vm_next) {
++			unsigned long vaddr;
++			loff_t offset;
++
++			if (!valid_vma(vma, false) ||
++			    file_inode(vma->vm_file) != uprobe->inode)
++				continue;
++
++			offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
++			if (uprobe->offset <  offset ||
++			    uprobe->offset >= offset + vma->vm_end - vma->vm_start)
++				continue;
++
++			vaddr = offset_to_vaddr(vma, uprobe->offset);
++			err |= remove_breakpoint(uprobe, mm, vaddr);
++		}
++		up_read(&mm->mmap_sem);
+ 	}
+-	up_read(&mm->mmap_sem);
+ 
+ 	return err;
+ }
+@@ -1003,7 +1254,9 @@ find_node_in_range(struct inode *inode, loff_t min, loff_t max)
+ 	while (n) {
+ 		struct uprobe *u = rb_entry(n, struct uprobe, rb_node);
+ 
+-		if (inode < u->inode) {
++		if (test_bit(UPROBE_ANONYMOUS, &u->flags)) {
++			n = n->rb_left;
++		} else if (inode < u->inode) {
+ 			n = n->rb_left;
+ 		} else if (inode > u->inode) {
+ 			n = n->rb_right;
+@@ -1020,8 +1273,36 @@ find_node_in_range(struct inode *inode, loff_t min, loff_t max)
+ 	return n;
+ }
+ 
++static struct rb_node *
++find_anonymous_node_in_range(struct mm_struct *mm, unsigned long start, unsigned long end)
++{
++	struct rb_node *n = uprobes_tree.rb_node;
++
++	while (n) {
++		struct uprobe *u = rb_entry(n, struct uprobe, rb_node);
++
++		if (!test_bit(UPROBE_ANONYMOUS, &u->flags)) {
++			n = n->rb_right;
++		} else if (mm < u->mm) {
++			n = n->rb_left;
++		} else if (mm > u->mm) {
++			n = n->rb_right;
++		} else {
++			if (end < u->vaddr)
++				n = n->rb_left;
++			else if (start > u->vaddr)
++				n = n->rb_right;
++			else
++				break;
++		}
++	}
++
++	return n;
++}
++
+ /*
+  * For a given range in vma, build a list of probes that need to be inserted.
++ * This never finds any anonymous probes (which is fine, because they never need to be re-inserted)
+  */
+ static void build_probe_list(struct inode *inode,
+ 				struct vm_area_struct *vma,
+@@ -1073,6 +1354,10 @@ int uprobe_mmap(struct vm_area_struct *vma)
+ 		return 0;
+ 
+ 	inode = file_inode(vma->vm_file);
++	/*
++	 * If a mapped region does not have an inode, it does not have any probes
++	 * that we need to copy. (Anonymous uprobes are never copied this way).
++	 */
+ 	if (!inode)
+ 		return 0;
+ 
+@@ -1101,16 +1386,23 @@ vma_has_uprobes(struct vm_area_struct *vma, unsigned long start, unsigned long e
+ {
+ 	loff_t min, max;
+ 	struct inode *inode;
+-	struct rb_node *n;
++	struct rb_node *n = NULL;
+ 
+-	inode = file_inode(vma->vm_file);
++	if (vma->vm_file) {
++		inode = file_inode(vma->vm_file);
+ 
+-	min = vaddr_to_offset(vma, start);
+-	max = min + (end - start) - 1;
++		min = vaddr_to_offset(vma, start);
++		max = min + (end - start) - 1;
+ 
+-	spin_lock(&uprobes_treelock);
+-	n = find_node_in_range(inode, min, max);
+-	spin_unlock(&uprobes_treelock);
++		spin_lock(&uprobes_treelock);
++		n = find_node_in_range(inode, min, max);
++		spin_unlock(&uprobes_treelock);
++	}
++	if (!vma->vm_file || !n) {
++		spin_lock(&uprobes_treelock);
++		n = find_anonymous_node_in_range(vma->vm_mm, start, end);
++		spin_unlock(&uprobes_treelock);
++	}
+ 
+ 	return !!n;
+ }
+@@ -1739,10 +2031,14 @@ static struct uprobe *find_active_uprobe(unsigned long bp_vaddr, int *is_swbp)
+ 	vma = find_vma(mm, bp_vaddr);
+ 	if (vma && vma->vm_start <= bp_vaddr) {
+ 		if (valid_vma(vma, false)) {
+-			struct inode *inode = file_inode(vma->vm_file);
+-			loff_t offset = vaddr_to_offset(vma, bp_vaddr);
+-
+-			uprobe = find_uprobe(inode, offset);
++			if (vma->vm_file) {
++				struct inode *inode = file_inode(vma->vm_file);
++				loff_t offset = vaddr_to_offset(vma, bp_vaddr);
++
++				uprobe = find_uprobe(inode, offset);
++			}
++			if (!vma->vm_file || !uprobe)
++				uprobe = find_anonymous_uprobe(mm, bp_vaddr);
+ 		}
+ 
+ 		if (!uprobe)

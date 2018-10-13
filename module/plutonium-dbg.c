@@ -115,63 +115,35 @@ static pid_t tgid_from_tid(pid_t tid)
 }
 
 /**
- * compute_location - computes the location of the breakpoint as an inode/offset pair
- * @location: The location to write to
- * @target:   The target TGID or TID
- * @address:  The address of the breakpoint
- *
- * Returns -ESRCH  if the target task does not exist.
- * Returns -EACCES if the target has no memory map (likely a kernel task)
- * Returns -EFAULT if the target address is not mapped
- * Returns -EBADF  if the target address has no inode
- */
-static int compute_location(struct probe_location *location, pid_t target, addr_t address)
-{
-	struct task_struct    *task;
-	struct mm_struct      *mm;
-	struct vm_area_struct *vma;
-	TRACE("compute_location(%p, %d, %lx)\n", location, target, address);
-
-	/* Get the memory mapping for this process */
-	rcu_read_lock();
-	task = pid_task(find_vpid(target), PIDTYPE_PID);
-	if (task == NULL)
-		cleanup_and_return(-ESRCH, rcu_read_unlock());
-	get_task_struct(task);
-	rcu_read_unlock();
-
-	mm = get_task_mm(task);
-	if (mm == NULL)
-		cleanup_and_return(-EACCES, put_task_struct(task));
-
-	vma = find_vma(mm, address);
-	if (vma == NULL)
-		cleanup_and_return(-EFAULT, mmput(mm), put_task_struct(task));
-
-	/* Get the inode and offset */
-	if (vma->vm_file == NULL || vma->vm_file->f_inode == NULL)
-		cleanup_and_return(-EBADF, mmput(mm), put_task_struct(task));
-
-	location->inode  = vma->vm_file->f_inode;
-	location->offset = (loff_t) (address - vma->vm_start + vma->vm_pgoff * PAGE_SIZE);
-
-	mmput(mm);
-	put_task_struct(task);
-	return 0;
-}
-
-/**
  * delete_dead_breakpoint - Cleans up a dead breakpoint.
  * @work: The work_struct for the deferred task.
  */
 static void delete_dead_breakpoint(struct work_struct *work)
 {
+	struct task_struct     *task;
+	struct mm_struct       *mm;
 	struct dead_breakpoint *dead = container_of(work, struct dead_breakpoint, work);
 
-	TRACE("Deleting dead breakpoint probe <%d:%lx> := <%lu:%lld>\n", dead->bp->target, dead->bp->address, dead->bp->probe.inode->i_ino, dead->bp->probe.offset);
-	uprobe_unregister(dead->bp->probe.inode, dead->bp->probe.offset, &dead->bp->handler);
+	TRACE("Deleting dead breakpoint probe <%d:%lx>\n", dead->bp->target, dead->bp->address);
+
+
+	rcu_read_lock();
+	task = pid_task(find_vpid(dead->bp->target), PIDTYPE_PID);
+	if (task == NULL)
+		cleanup_and_return_void(rcu_read_unlock());
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		cleanup_and_return_void(put_task_struct(task));
+
+	uprobe_unregister_anonymous(mm, dead->bp->address, &dead->bp->handler);
 	kfree(dead->bp);
 	kfree(dead);
+
+	mmput(mm);
+	put_task_struct(task);
 }
 
 /**
@@ -225,6 +197,7 @@ static bool __is_exiting(pid_t tid)
 static void suspend_thread(pid_t tid)
 {
 	struct task_struct *task;
+	struct mm_struct   *mm;
 	struct breakpoint  *bp;
 	TRACE("suspend_thread(%d)\n", tid);
 
@@ -235,6 +208,10 @@ static void suspend_thread(pid_t tid)
 	get_task_struct(task);
 	rcu_read_unlock();
 
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		cleanup_and_return_void(put_task_struct(task));
+
 	if (current->pid != tid) {
 		TRACE("suspending foreign thread (%d => %d)\n", current->pid, task->pid);
 		mutex_lock(&suspension_mutex);
@@ -242,12 +219,12 @@ static void suspend_thread(pid_t tid)
 		/* If the target thread has a pending suspension, do nothing */
 		FIND_LIST_ENTRY(bp, &pending_suspensions, node, bp->target == tid);
 		if (bp != NULL)
-			cleanup_and_return_void(mutex_unlock(&suspension_mutex), put_task_struct(task));
+			cleanup_and_return_void(mutex_unlock(&suspension_mutex), mmput(mm), put_task_struct(task));
 
 		/* Allocate a temporary breakpoint */
 		if (!ALLOC_PTR(bp)) {
 			printk(KERN_ERR "Out of memory: cannot suspend foreign thread %d", tid);
-			cleanup_and_return_void(mutex_unlock(&suspension_mutex), put_task_struct(task));
+			cleanup_and_return_void(mutex_unlock(&suspension_mutex), mmput(mm), put_task_struct(task));
 		}
 
 		/* NB: If the process is already in kernel space, we are in trouble.
@@ -267,8 +244,6 @@ static void suspend_thread(pid_t tid)
 		/* Set a temporary breakpoint at the instruction pointer to hand control to plutonium-dbg */
 		bp->target              = tid;
 		bp->address             = instruction_pointer(task_pt_regs(task));
-		bp->probe.inode         = NULL;
-		bp->probe.offset        = 0;
 		bp->handler.handler     = &handle_suspension_breakpoint;
 		bp->handler.ret_handler = NULL;
 		bp->handler.filter      = NULL;
@@ -278,9 +253,8 @@ static void suspend_thread(pid_t tid)
 		list_add_tail(&bp->node, &pending_suspensions);
 		mutex_unlock(&suspension_mutex);
 
-		compute_location(&bp->probe, bp->target, bp->address);
-		TRACE("suspension for TID %d, IP %lx as %lu:%lld\n", tid, bp->address, bp->probe.inode->i_ino, bp->probe.offset);
-		if (uprobe_register(bp->probe.inode, bp->probe.offset, &bp->handler) != 0)
+		TRACE("suspension for TID %d, IP %lx\n", tid, bp->address);
+		if (uprobe_register_anonymous(mm, bp->address, &bp->handler) != 0)
 			printk(KERN_ERR "Could not register suspension probe for TID %d at address %lx.\n", tid, bp->address);
 
 		/* Wake up the process so we hit the breakpoint */
@@ -289,6 +263,7 @@ static void suspend_thread(pid_t tid)
 	} else {
 		smp_store_mb(task->state, TASK_KILLABLE);
 	}
+	mmput(mm);
 	put_task_struct(task);
 }
 
@@ -413,9 +388,11 @@ static struct victim *__victim(pid_t victim_tid)
  */
 static struct breakpoint *__breakpoint(pid_t victim_tid, addr_t addr)
 {
-	struct victim     *vct;
-	struct breakpoint *bp;
-	int                result;
+	struct task_struct *task;
+	struct mm_struct   *mm;
+	struct victim      *vct;
+	struct breakpoint  *bp;
+	int                 result;
 	TRACE("__breakpoint(%d, %lx)\n", victim_tid, addr);
 
 	/* Get the victim */
@@ -436,9 +413,6 @@ static struct breakpoint *__breakpoint(pid_t victim_tid, addr_t addr)
 	bp->address = addr;
 	INIT_LIST_HEAD(&bp->attached);
 
-	bp->probe.inode  = NULL;
-	bp->probe.offset = 0;
-
 	bp->handler.handler     = &handle_breakpoint;
 	bp->handler.ret_handler = NULL;
 	bp->handler.filter      = NULL;
@@ -448,13 +422,22 @@ static struct breakpoint *__breakpoint(pid_t victim_tid, addr_t addr)
 	bp->state = BP_STATE_ACTIVE;
 
 	/* Install the probe */
-	result = compute_location(&bp->probe, bp->target, bp->address);
-	if (result != 0) {
-		printk(KERN_ERR "Could not find probe location for TGID %d, address %lx: Error %d.\n", victim_tid, addr, result);
-		kfree(bp);
-		return ERR_PTR(result);
-	}
-	result = uprobe_register(bp->probe.inode, bp->probe.offset, &bp->handler);
+	rcu_read_lock();
+	task = pid_task(find_vpid(victim_tid), PIDTYPE_PID);
+	if (task == NULL)
+		cleanup_and_return(ERR_PTR(-ESRCH), rcu_read_unlock());
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		cleanup_and_return(ERR_PTR(-ESRCH), put_task_struct(task));
+
+	result = uprobe_register_anonymous(mm, bp->address, &bp->handler);
+
+	mmput(mm);
+	put_task_struct(task);
+
 	if (result != 0) {
 		printk(KERN_ERR "Could not register probe for TGID %d, address %lx: Error %d.\n", victim_tid, addr, result);
 		kfree(bp);
@@ -522,17 +505,14 @@ static void __delete_breakpoint(struct breakpoint *bp)
 
 	list_del(&bp->node);
 
-	if (bp->probe.inode != NULL || compute_location(&bp->probe, bp->target, bp->address) == 0) {
-		/* Unregister this breakpoint from another task that can block if necessary */
-		if (!ALLOC_PTR(deferred)) {
-			printk(KERN_ERR "Could not defer cleanup for breakpoint at TGID %d, address %lx\n", bp->target, bp->address);
-			return;
-		}
-		INIT_WORK(&deferred->work, delete_dead_breakpoint);
-		deferred->bp = bp;
-		queue_work(deferred_queue, &deferred->work);
+	/* Unregister this breakpoint from another task that can block if necessary */
+	if (!ALLOC_PTR(deferred)) {
+		printk(KERN_ERR "Could not defer cleanup for breakpoint at TGID %d, address %lx\n", bp->target, bp->address);
+		return;
 	}
-	kfree(bp);
+	INIT_WORK(&deferred->work, delete_dead_breakpoint);
+	deferred->bp = bp;
+	queue_work(deferred_queue, &deferred->work);
 }
 
 /**

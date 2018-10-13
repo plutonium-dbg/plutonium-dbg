@@ -16,22 +16,10 @@
 typedef unsigned long addr_t;
 
 /**
- * probe_location - Location of a probe underlying a breakpoint
- * @inode:  The inode in which the probe is contained
- * @offset: Offset of the probe in the inode
- */
-struct probe_location {
-	struct inode *inode;
-	loff_t        offset;
-};
-
-/**
  * breakpoint - A breakpoint
  * @node:     Entry in the victim's breakpoint list
  * @target:   The TGID of the victim this breakpoint is valid for
  * @address:  The address of the breakpoint, in the victim's address space
- * @inode:    The inode in which the underlying probe is contained
- * @offset:   Offset of the underlying probe in the inode
  * @attached: A list of attached configurations.
  * @counter:  Number of locks currently held at this breakpoint
  * @state:    Breakpoint state
@@ -40,7 +28,6 @@ struct breakpoint {
 	struct list_head        node;
 	pid_t                   target;
 	addr_t                  address;
-	struct probe_location   probe;
 	struct list_head        attached;
 	struct uprobe_consumer  handler;
 
