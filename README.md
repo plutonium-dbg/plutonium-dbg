@@ -70,7 +70,7 @@ You can start a VM by running the `run.sh` script in the VM folder. Each VM is a
 
 Compile the kernel module by running `make` in the `module` folder, then copy the `plutonium-dbg.ko` file and any of the Python scripts you wish to use to your target machine.
 
-#### Compilation for host system
+#### Compilation for Host System
 
 You can also compile plutonium-dbg for your host system by replacing the path to the kernel in `module/Makefile` to `/lib/modules/$(shell uname -r)/build` (just uncomment the corresponding line). This requires the development headers for your kernel version, but allows you to avoid using QEMU. Note that plutonium-dbg is not yet stable; do not do this outside of a virtual machine unless you are happy to accidentally crash your system.
 
@@ -87,6 +87,12 @@ sudo yum install kernel-devel
 ```
 
 Unfortunately, plutonium-dbg currently does not actually build with RHEL7'ish (e.g., CentOS 7) kernel headers - pull requests to make this actually work are welcome.
+
+#### Tested Distributions
+
+- Debian Stretch (4.17-rc2)
+- OpenSUSE Tumbleweed (4.18.12)
+
 
 ## Contributing
 
