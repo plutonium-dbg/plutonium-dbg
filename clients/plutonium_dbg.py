@@ -86,6 +86,7 @@ class commands:
     cmd_reason         = ioctl(ord("@"), 12, ioctl.RW, ctypes.sizeof(messages.ioctl_flag))
     cmd_read_mem       = ioctl(ord("@"), 20, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
     cmd_write_mem      = ioctl(ord("@"), 21, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
+    cmd_read_auxv      = ioctl(ord("@"), 22, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
     cmd_read_regs      = ioctl(ord("@"), 30, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
     cmd_write_regs     = ioctl(ord("@"), 31, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
 
@@ -215,6 +216,14 @@ class debugger:
         info = messages.ioctl_cpy(tgid, address, ctypes.c_void_p(ctypes.addressof(buf)), size)
         commands.cmd_read_mem.send(self.device, info)
         return bytes(buf.raw)
+    def read_auxv(self, tgid):
+        # XXX: Pretty arbitrary, enough space to hold auxiliary vector
+        size = 0x400
+        buf = ctypes.create_string_buffer(size)
+        # XXX: address argument is ignored by read_auxv
+        info = messages.ioctl_cpy(tgid, 0, ctypes.c_void_p(ctypes.addressof(buf)), size)
+        l = commands.cmd_read_auxv.send(self.device, info)
+        return bytes(buf.raw)[:l]
     def write_memory(self, tgid, address, contents):
         buf = ctypes.create_string_buffer(contents)
         info = messages.ioctl_cpy(tgid, address, ctypes.c_void_p(ctypes.addressof(buf)), len(contents))

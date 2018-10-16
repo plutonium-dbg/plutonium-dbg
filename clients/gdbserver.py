@@ -35,7 +35,6 @@ from binascii import hexlify, unhexlify
 from plutonium_dbg import debugger
 from subprocess import check_output
 
-
 # globals
 # TODO create hierarchy/class-structure for encapsulation
 GDB_SIGNAL_TRAP = 5
@@ -43,6 +42,15 @@ PACKET_SIZE = 4096
 log = None
 mod = debugger()
 tgid = 0
+
+# A list of tuples describing the debuggee's auxiliary vector (man 3 getauxval)
+auxv = []
+# 8 for 64 bit deubggees, 4 otherwise
+ptrsz = 0
+# helper for struct.[un]pack: "Q" for 64 bit debuggees, "I" otherwise
+ptrspec = ""
+# helper for struct.[un]pack: "<" for little endian debuggees, ">" otherwise
+bitness = ""
 
 class pt_regs(ctypes.Structure):
     _fields_ = [("r15",   ctypes.c_ulong),
@@ -136,16 +144,29 @@ def parse(packet):
 
     return data
 
+def _binary_escape(bs):
+
+    res = b""
+    for i, b in enumerate(bs):
+        if b in [ b"#", b"$", b"}", b"*" ]:
+            res += b"}" + (b ^ 0x20)
+        else:
+            res += bytes([b])
+
+    return res
+
 
 def send(conn, msg):
     """Send a packet to the GDB client
-    msg has to be string
+    msg can be string or bytestring
     """
-    msg_b = msg.encode('ascii')
-    # TODO: handle escaping properly here
-    if b'$' in msg_b or b'#' in msg_b:
-        log.error('Can not send ' + msg + ' due to lack of encoding of special characters')
-        return
+
+    # XXX: I feel soooooo bad for doing this :(
+    if type(msg) == bytes:
+        msg_b = _binary_escape(msg)
+    else:
+        msg_b = _binary_escape(msg.encode('ascii'))
+
     chk = hex(checksum(msg_b))[2:].rjust(2, "0").encode('ascii')
     send_raw(conn, b'$' + msg_b + b'#' + chk)
 
@@ -166,6 +187,8 @@ def _query(request):
         return '1' # to indicate that we attached to a running process
     if request == 'C':
         return 'QC' + hex(tgid)[2:]
+    if request.startswith('Xfer:auxv:read'):
+        return _q_auxv_read(request)
     return ""
 
 
@@ -179,8 +202,30 @@ def _q_supported(request):
     supported = ['no-resumed+', 'swbreak+']
     for x in supported:
         assert_support(x)
+
+    # add features only supported by the server
+    supported.extend(['qXfer:auxv:read+'])
+
     return 'PacketSize=%x;' % PACKET_SIZE + ';'.join(supported)
 
+
+def _q_auxv_read(request):
+    log.info('Received a "read auxiliary vector" command')
+
+    off, l = map(lambda x: int(x, 16), request.split('::')[1].split(','))
+    print(off, l)
+
+    tmp = b''
+    for a in auxv:
+        tmp += b''.join(map(lambda x: struct.pack(endness + ptrspec, x), a))
+
+    # auxval HAS to end with two 0 entries
+    tmp += b"\x00" * (ptrsz * 2)
+
+    # pad to match requested length
+    res = tmp[off:][:l]
+
+    return b"l" + res
 
 def _memory_read(request):
     # we don't need to loop over tid's here, since threads share memory space anyways.
@@ -318,7 +363,6 @@ def get_active_tids(op_type):
         return active_tids[op_type]
     return [tgid]
 
-
 handlers = {
     'q' : _query,
     'm' : _memory_read,
@@ -384,10 +428,60 @@ def main_loop(conn):
                 handled_events.append(event)
         events = [e for e in events if not e in handled_events]
 
+def _get_auxv():
+    """ This retrieves the "auxiliary vector", a very useful (man 3 getauxval)
+    datastructure from the debuggee. As the layout of the auxiliary vector
+    is key, value alike, we also use this to determine the debugees bitness and
+    endianness. """
+    global log
+    global tgid
+    global ptrsz
+    global ptrspec
+    global endness
+
+    i = 0
+    res = []
+
+    AT_MAX = 0x40
+
+    mem = mod.read_auxv(tgid)
+
+    # TODO: It would be nice to know guest bitness and endianness here.
+    # For now we have to live with this hack.
+    if all(map(lambda x: x < AT_MAX, struct.unpack("<10I", mem[:10*4])[2::2])):
+        ptrsz = 4
+        endness = "<"
+    elif all(map(lambda x: x < AT_MAX, struct.unpack("<10Q", mem[:10*8])[2::2])):
+        ptrsz = 8
+        endness = "<"
+    elif all(map(lambda x: x < AT_MAX, struct.unpack(">10I", mem[:10*4])[2::2])):
+        ptrsz = 4
+        endness = ">"
+    elif all(map(lambda x: x < AT_MAX, struct.unpack(">10I", mem[:10*8])[2::2])):
+        ptrsz = 8
+        endness = ">"
+    else:
+        log.warn("Unable to fetch auxiliary vector. Unknown debuggee bitness and endianness?")
+        return res
+
+    ptrspec = "I" if ptrsz == 4 else "Q"
+
+    while 2 * i * ptrsz < len(mem):
+        key, val = struct.unpack(endness + "2" + ptrspec, mem[2*i*ptrsz:][:2*ptrsz])
+        if key == val == 0:
+            break
+
+        res.append((key, val))
+
+        i += 1
+
+    return res
+
 
 def main(program_args):
     global log
     global tgid
+    global auxv
 
     logging.basicConfig(level = logging.DEBUG)
     log = logging.getLogger('')
@@ -409,6 +503,8 @@ def main(program_args):
     conn, addr = sock.accept()
     conn.setblocking(0)
     log.info('connected')
+
+    auxv = _get_auxv()
 
     try:
         main_loop(conn)

@@ -1294,6 +1294,37 @@ static int handle_suspension_breakpoint(struct uprobe_consumer *self, struct pt_
 	return 0;
 }
 
+static int read_auxv(pid_t tid, size_t size, char __user *uptr)
+{
+	struct task_struct *task;
+	struct mm_struct   *mm;
+
+	//TRACE("read_auxv(%d, %lu, %p)\n", tid, size, uptr);
+
+	/* Get the memory mapping for this process */
+	rcu_read_lock();
+	task = pid_task(find_vpid(tid), PIDTYPE_PID);
+	if (task == NULL)
+		cleanup_and_return(-ESRCH, rcu_read_unlock());
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		cleanup_and_return(-EACCES, task_unlock(task), put_task_struct(task));
+
+	/* Copy contents of auxv to userspace if the buffer is large enough) */
+	if (size < AT_VECTOR_SIZE * sizeof(void *))
+		cleanup_and_return(-EINVAL, task_unlock(task), put_task_struct(task));
+
+	if ((copy_to_user(uptr, mm->saved_auxv, AT_VECTOR_SIZE * sizeof(void *))) != 0)
+		cleanup_and_return(-EFAULT, mmput(mm), put_task_struct(task));
+
+	mmput(mm);
+	put_task_struct(task);
+
+	return AT_VECTOR_SIZE * sizeof(void *);
+}
 
 
 /* Copy operations */
@@ -1721,6 +1752,7 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 #define IOCTL_SUSPEND_REASON     _IOWR(IOCTL_CODE, 12, struct ioctl_flag)
 #define IOCTL_READ_MEMORY        _IOWR(IOCTL_CODE, 20, struct ioctl_cpy)
 #define IOCTL_WRITE_MEMORY       _IOWR(IOCTL_CODE, 21, struct ioctl_cpy)
+#define IOCTL_READ_AUXV          _IOWR(IOCTL_CODE, 22, struct ioctl_cpy)
 #define IOCTL_READ_REGISTERS     _IOWR(IOCTL_CODE, 30, struct ioctl_cpy)
 #define IOCTL_WRITE_REGISTERS    _IOWR(IOCTL_CODE, 31, struct ioctl_cpy)
 
@@ -1888,6 +1920,11 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		arg_cpy = (struct ioctl_cpy *) argument;
 		//TRACE("ioctl: read_memory(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
 		return copy_memory(arg_cpy->target, arg_cpy->which, arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_TO_USERSPACE);
+
+	case IOCTL_READ_AUXV:
+		arg_cpy = (struct ioctl_cpy *) argument;
+		//TRACE("ioctl: read_auxv(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
+		return read_auxv(arg_cpy->target, arg_cpy->size, (char __user *) arg_cpy->buffer);
 
 	case IOCTL_WRITE_MEMORY:
 		arg_cpy = (struct ioctl_cpy *) argument;
