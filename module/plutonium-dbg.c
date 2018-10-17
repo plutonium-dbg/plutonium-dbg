@@ -1929,9 +1929,6 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		arg_enumeration = (struct ioctl_enumeration *) argument;
 		TRACE("ioctl: wait() from %d\n", current->pid);
 
-		if ((result = check_access(arg_enumeration->target)))
-			return result;
-
 		for (;;) {
 			/* Check whether to suspend */
 			mutex_lock(&data_mutex);
@@ -2032,6 +2029,8 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 	case IOCTL_READ_AUXV:
 		arg_cpy = (struct ioctl_cpy *) argument;
 		//TRACE("ioctl: read_auxv(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
+		if ((result = check_access(arg_cpy->target)))
+			return result;
 		return read_auxv(arg_cpy->target, arg_cpy->size, (char __user *) arg_cpy->buffer);
 
 	case IOCTL_WRITE_MEMORY:
