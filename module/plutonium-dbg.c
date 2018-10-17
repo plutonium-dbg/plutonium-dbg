@@ -1311,11 +1311,11 @@ static int read_auxv(pid_t tid, size_t size, char __user *uptr)
 
 	mm = get_task_mm(task);
 	if (mm == NULL)
-		cleanup_and_return(-EACCES, task_unlock(task), put_task_struct(task));
+		cleanup_and_return(-EACCES, put_task_struct(task));
 
 	/* Copy contents of auxv to userspace if the buffer is large enough) */
 	if (size < AT_VECTOR_SIZE * sizeof(void *))
-		cleanup_and_return(-EINVAL, task_unlock(task), put_task_struct(task));
+		cleanup_and_return(-EINVAL, mmput(mm), put_task_struct(task));
 
 	if ((copy_to_user(uptr, mm->saved_auxv, AT_VECTOR_SIZE * sizeof(void *))) != 0)
 		cleanup_and_return(-EFAULT, mmput(mm), put_task_struct(task));
@@ -1366,7 +1366,7 @@ static int copy_memory(pid_t tid, addr_t addr, size_t size, char __user *uptr, c
 
 	mm = get_task_mm(task);
 	if (mm == NULL)
-		cleanup_and_return(-EACCES, task_unlock(task), put_task_struct(task));
+		cleanup_and_return(-EACCES, put_task_struct(task));
 
 	/* Copy data via access_process_vm. __access_remote_vm would be more efficient, but isn't exported. */
 	for (copied = 0; copied < size;) {
