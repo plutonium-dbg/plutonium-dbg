@@ -1374,6 +1374,37 @@ static int handle_suspension_breakpoint(struct uprobe_consumer *self, struct pt_
 	return 0;
 }
 
+static int read_auxv(pid_t tid, size_t size, char __user *uptr)
+{
+	struct task_struct *task;
+	struct mm_struct   *mm;
+
+	//TRACE("read_auxv(%d, %lu, %p)\n", tid, size, uptr);
+
+	/* Get the memory mapping for this process */
+	rcu_read_lock();
+	task = pid_task(find_vpid(tid), PIDTYPE_PID);
+	if (task == NULL)
+		cleanup_and_return(-ESRCH, rcu_read_unlock());
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	mm = get_task_mm(task);
+	if (mm == NULL)
+		cleanup_and_return(-EACCES, put_task_struct(task));
+
+	/* Copy contents of auxv to userspace if the buffer is large enough) */
+	if (size < AT_VECTOR_SIZE * sizeof(void *))
+		cleanup_and_return(-EINVAL, mmput(mm), put_task_struct(task));
+
+	if ((copy_to_user(uptr, mm->saved_auxv, AT_VECTOR_SIZE * sizeof(void *))) != 0)
+		cleanup_and_return(-EFAULT, mmput(mm), put_task_struct(task));
+
+	mmput(mm);
+	put_task_struct(task);
+
+	return AT_VECTOR_SIZE * sizeof(void *);
+}
 
 
 /* Copy operations */
@@ -1415,7 +1446,7 @@ static int copy_memory(pid_t tid, addr_t addr, size_t size, char __user *uptr, c
 
 	mm = get_task_mm(task);
 	if (mm == NULL)
-		cleanup_and_return(-EACCES, task_unlock(task), put_task_struct(task));
+		cleanup_and_return(-EACCES, put_task_struct(task));
 
 	/* Copy data via access_process_vm. __access_remote_vm would be more efficient, but isn't exported. */
 	for (copied = 0; copied < size;) {
@@ -1786,22 +1817,24 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 
 #define IOCTL_CODE '@'
 
-#define IOCTL_CONTINUE           _IOW(IOCTL_CODE, 0, struct ioctl_tid_or_tgid)
-#define IOCTL_SUSPEND            _IOW(IOCTL_CODE, 1, struct ioctl_tid_or_tgid)
-#define IOCTL_INSTALL_BREAKPOINT _IOW(IOCTL_CODE, 2, struct ioctl_breakpoint_identifier)
-#define IOCTL_REMOVE_BREAKPOINT  _IOW(IOCTL_CODE, 3, struct ioctl_breakpoint_identifier)
-#define IOCTL_SET_STEP           _IOW(IOCTL_CODE, 4, struct ioctl_flag)
-#define IOCTL_SET_EVENT_MASK     _IOW(IOCTL_CODE, 5, struct ioctl_flag)
+#define IOCTL_CONTINUE           _IOW(IOCTL_CODE,  0, struct ioctl_tid_or_tgid)
+#define IOCTL_SUSPEND            _IOW(IOCTL_CODE,  1, struct ioctl_tid_or_tgid)
+#define IOCTL_INSTALL_BREAKPOINT _IOW(IOCTL_CODE, 10, struct ioctl_breakpoint_identifier)
+#define IOCTL_REMOVE_BREAKPOINT  _IOW(IOCTL_CODE, 11, struct ioctl_breakpoint_identifier)
+#define IOCTL_SET_STEP           _IOW(IOCTL_CODE, 20, struct ioctl_flag)
+#define IOCTL_SET_EVENT_MASK     _IOW(IOCTL_CODE, 30, struct ioctl_flag)
 
-#define IOCTL_WAIT               _IOWR(IOCTL_CODE, 0, struct ioctl_enumeration)
-#define IOCTL_WAIT_FOR           _IOWR(IOCTL_CODE, 1, struct ioctl_enumeration)
-#define IOCTL_STATUS             _IOWR(IOCTL_CODE, 2, struct ioctl_enumeration)
-#define IOCTL_ENUMERATE_THREADS  _IOWR(IOCTL_CODE, 3, struct ioctl_enumeration)
-#define IOCTL_SUSPEND_REASON     _IOWR(IOCTL_CODE, 4, struct ioctl_flag)
-#define IOCTL_READ_MEMORY        _IOWR(IOCTL_CODE, 5, struct ioctl_cpy)
-#define IOCTL_WRITE_MEMORY       _IOWR(IOCTL_CODE, 6, struct ioctl_cpy)
-#define IOCTL_READ_REGISTERS     _IOWR(IOCTL_CODE, 7, struct ioctl_cpy)
-#define IOCTL_WRITE_REGISTERS    _IOWR(IOCTL_CODE, 8, struct ioctl_cpy)
+#define IOCTL_WAIT               _IOWR(IOCTL_CODE,  0, struct ioctl_enumeration)
+#define IOCTL_WAIT_FOR           _IOWR(IOCTL_CODE,  1, struct ioctl_enumeration)
+#define IOCTL_EVENTS             _IOWR(IOCTL_CODE,  2, struct ioctl_enumeration)
+#define IOCTL_STATUS             _IOWR(IOCTL_CODE, 10, struct ioctl_enumeration)
+#define IOCTL_ENUMERATE_THREADS  _IOWR(IOCTL_CODE, 11, struct ioctl_enumeration)
+#define IOCTL_SUSPEND_REASON     _IOWR(IOCTL_CODE, 12, struct ioctl_flag)
+#define IOCTL_READ_MEMORY        _IOWR(IOCTL_CODE, 20, struct ioctl_cpy)
+#define IOCTL_WRITE_MEMORY       _IOWR(IOCTL_CODE, 21, struct ioctl_cpy)
+#define IOCTL_READ_AUXV          _IOWR(IOCTL_CODE, 22, struct ioctl_cpy)
+#define IOCTL_READ_REGISTERS     _IOWR(IOCTL_CODE, 30, struct ioctl_cpy)
+#define IOCTL_WRITE_REGISTERS    _IOWR(IOCTL_CODE, 31, struct ioctl_cpy)
 
 /**
  * on_ioctl - handles an incoming IOCTL
@@ -1949,6 +1982,25 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		}
 		return 0;
 
+	case IOCTL_EVENTS:
+		arg_enumeration = (struct ioctl_enumeration *) argument;
+		TRACE("ioctl: events() from %d\n", current->pid);
+
+		mutex_lock(&data_mutex);
+		dbg = __debugger(current->tgid);
+
+		if (IS_ERR(dbg))
+			cleanup_and_return(PTR_ERR(dbg), mutex_unlock(&data_mutex));
+
+		/* Return events if there are any in the queue */
+		if (!list_empty(&dbg->event_queue))
+			result = __dump_event_queue(arg_enumeration->target, current->tgid, arg_enumeration);
+		else
+			result = arg_enumeration->size = arg_enumeration->available = 0;
+
+		mutex_unlock(&data_mutex);
+		return result;
+
 	case IOCTL_STATUS:
 		arg_enumeration = (struct ioctl_enumeration *) argument;
 		TRACE("ioctl: read_status(%d) from %d\n", arg_enumeration->target, current->pid);
@@ -1976,6 +2028,11 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		if ((result = check_access(arg_cpy->target)))
 			return result;
 		return copy_memory(arg_cpy->target, arg_cpy->which, arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_TO_USERSPACE);
+
+	case IOCTL_READ_AUXV:
+		arg_cpy = (struct ioctl_cpy *) argument;
+		//TRACE("ioctl: read_auxv(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
+		return read_auxv(arg_cpy->target, arg_cpy->size, (char __user *) arg_cpy->buffer);
 
 	case IOCTL_WRITE_MEMORY:
 		arg_cpy = (struct ioctl_cpy *) argument;

@@ -72,21 +72,23 @@ class messages:
 
 # List of IOCTL commands
 class commands:
-    cmd_continue       = ioctl(ord("@"), 0, ioctl.W, ctypes.sizeof(messages.ioctl_tid_or_tgid))
-    cmd_suspend        = ioctl(ord("@"), 1, ioctl.W, ctypes.sizeof(messages.ioctl_tid_or_tgid))
-    cmd_install_bp     = ioctl(ord("@"), 2, ioctl.W, ctypes.sizeof(messages.ioctl_breakpoint_identifier))
-    cmd_remove_bp      = ioctl(ord("@"), 3, ioctl.W, ctypes.sizeof(messages.ioctl_breakpoint_identifier))
-    cmd_set_step       = ioctl(ord("@"), 4, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
-    cmd_set_event_mask = ioctl(ord("@"), 5, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
-    cmd_wait           = ioctl(ord("@"), 0, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
-    cmd_wait_for       = ioctl(ord("@"), 1, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
-    cmd_status         = ioctl(ord("@"), 2, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
-    cmd_enum_threads   = ioctl(ord("@"), 3, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
-    cmd_reason         = ioctl(ord("@"), 4, ioctl.RW, ctypes.sizeof(messages.ioctl_flag))
-    cmd_read_mem       = ioctl(ord("@"), 5, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
-    cmd_write_mem      = ioctl(ord("@"), 6, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
-    cmd_read_regs      = ioctl(ord("@"), 7, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
-    cmd_write_regs     = ioctl(ord("@"), 8, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
+    cmd_continue       = ioctl(ord("@"),  0, ioctl.W, ctypes.sizeof(messages.ioctl_tid_or_tgid))
+    cmd_suspend        = ioctl(ord("@"),  1, ioctl.W, ctypes.sizeof(messages.ioctl_tid_or_tgid))
+    cmd_install_bp     = ioctl(ord("@"), 10, ioctl.W, ctypes.sizeof(messages.ioctl_breakpoint_identifier))
+    cmd_remove_bp      = ioctl(ord("@"), 11, ioctl.W, ctypes.sizeof(messages.ioctl_breakpoint_identifier))
+    cmd_set_step       = ioctl(ord("@"), 20, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
+    cmd_set_event_mask = ioctl(ord("@"), 30, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
+    cmd_wait           = ioctl(ord("@"),  0, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
+    cmd_wait_for       = ioctl(ord("@"),  1, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
+    cmd_events         = ioctl(ord("@"),  2, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
+    cmd_status         = ioctl(ord("@"), 10, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
+    cmd_enum_threads   = ioctl(ord("@"), 11, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
+    cmd_reason         = ioctl(ord("@"), 12, ioctl.RW, ctypes.sizeof(messages.ioctl_flag))
+    cmd_read_mem       = ioctl(ord("@"), 20, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
+    cmd_write_mem      = ioctl(ord("@"), 21, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
+    cmd_read_auxv      = ioctl(ord("@"), 22, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
+    cmd_read_regs      = ioctl(ord("@"), 30, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
+    cmd_write_regs     = ioctl(ord("@"), 31, ioctl.RW, ctypes.sizeof(messages.ioctl_cpy))
 
 
 # Actual client
@@ -150,6 +152,17 @@ class debugger:
             events.extend(debugger._parse_event(result_array[i]) for i in range(info.size))
             buf_size = 2 * info.available
         return events
+    def events(self):
+        buf_size = 256
+        events = []
+        while buf_size > 0:
+            buf = ctypes.create_string_buffer(buf_size * ctypes.sizeof(messages.ioctl_event))
+            info = messages.ioctl_enumeration(0, ctypes.c_void_p(ctypes.addressof(buf)), buf_size, 0)
+            commands.cmd_events.send(self.device, info)
+            result_array = ctypes.cast(buf, ctypes.POINTER(messages.ioctl_event))
+            events.extend(debugger._parse_event(result_array[i]) for i in range(info.size))
+            buf_size = 2 * info.available
+        return events
     def continue_thread(self, tid):
         info = messages.ioctl_tid_or_tgid(tid, 0)
         commands.cmd_continue.send(self.device, info)
@@ -203,6 +216,14 @@ class debugger:
         info = messages.ioctl_cpy(tgid, address, ctypes.c_void_p(ctypes.addressof(buf)), size)
         commands.cmd_read_mem.send(self.device, info)
         return bytes(buf.raw)
+    def read_auxv(self, tgid):
+        # XXX: Pretty arbitrary, enough space to hold auxiliary vector
+        size = 0x400
+        buf = ctypes.create_string_buffer(size)
+        # XXX: address argument is ignored by read_auxv
+        info = messages.ioctl_cpy(tgid, 0, ctypes.c_void_p(ctypes.addressof(buf)), size)
+        l = commands.cmd_read_auxv.send(self.device, info)
+        return bytes(buf.raw)[:l]
     def write_memory(self, tgid, address, contents):
         buf = ctypes.create_string_buffer(contents)
         info = messages.ioctl_cpy(tgid, address, ctypes.c_void_p(ctypes.addressof(buf)), len(contents))
