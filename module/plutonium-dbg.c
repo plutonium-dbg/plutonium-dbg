@@ -55,6 +55,7 @@ static void (*ks_user_enable_single_step)(struct task_struct *);
 static void (*ks_user_disable_single_step)(struct task_struct *);
 static int (*ks_get_signal)(struct ksignal *);
 static int (*ks_dequeue_signal)(struct task_struct *, sigset_t *, siginfo_t *);
+static int (*ks_security_ptrace_access_check)(struct task_struct *, unsigned int);
 
 static struct kprobe signal_probe;
 
@@ -89,6 +90,99 @@ static struct kprobe signal_probe;
 		if (&ptr->member == (head)) \
 			ptr = NULL; \
 	} while (0)
+
+
+
+/* Access control */
+
+/**
+ * check_access - Checks whether the current process is allowed to debug the target
+ * @target: The target thread or process
+ *
+ * Returns -ESRCH if the task does not exist.
+ * Returns -EPERM if access is denied.
+ * Returns 0 if access is granted.
+ *
+ * Access is granted if (a) the requesting thread is in the same thread group as
+ * the target, (b) the requesting process already has the permission to ptrace
+ * arbitrary processes (CAP_SYS_PTRACE), or (c)
+ *  - the requesting process' EUID equals the target's EUID, RUID, and SUID, and
+ *  - the requesting process' EGID equals the target's EGID, RGID, and SGID.
+ * For (c), we check the target's RUID (to ensure that processes which drop
+ * privileges can only be debugged by their owner or someone allowed to
+ * impersonate that owner), EUID (to ensure that processes with elevated
+ * privileges can only be debugged by someone with at least equivalent
+ * privileges), and SUID (to avoid any nasty surprises). This means that the
+ * "user history" (which user started the process, and what user it switched to)
+ * needs to be replicated exactly by the requesting process. On multi-user
+ * systems, this ensures that a privilege-dropping process owned by A cannot
+ * simply be debugged by a privilege-dropping process owned by B.
+ *
+ * For (c), we could additionally check whether ptrace access was limited by a
+ * kernel security module such as Yama (via yama.ptrace_scope) via
+ * security_ptrace_access_check, but the relevant functions are not exported by
+ * the kernel. We may revisit enabling this option to enhance security.
+ */
+static int check_access(pid_t target)
+{
+	int                 uid_check;
+	int                 gid_check;
+	int                 flags;
+	int                 lsm_result;
+	bool                capable;
+	struct task_struct *task;
+	const struct cred  *t_cred;
+	kuid_t              r_euid;
+	kgid_t              r_egid;
+
+	/* Get the task */
+	rcu_read_lock();
+	task = pid_task(find_vpid(target), PIDTYPE_PID);
+	if (task == NULL)
+		cleanup_and_return(-ESRCH, rcu_read_unlock());
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	t_cred = __task_cred(task);
+
+	/* Check thread groups */
+	if (same_thread_group(current, task))
+		cleanup_and_return(0, put_task_struct(task)); /* No delegation to LSM here */
+
+	/* Check global ptrace capability */
+	flags = current->flags;
+	capable = ns_capable(t_cred->user_ns, CAP_SYS_PTRACE);
+	if (!(flags & PF_SUPERPRIV))
+		current->flags &= ~PF_SUPERPRIV; /* ns_capable sets PF_SUPERPRIV, reset the state of that flag */
+
+	if (capable)
+		goto lsm;
+
+	/* Manually check IDs */
+	r_euid = current_euid();
+	r_egid = current_egid();
+
+	uid_check = uid_eq(r_euid, t_cred->euid) && uid_eq(r_euid, t_cred->uid) && uid_eq(r_euid, t_cred->suid);
+	gid_check = gid_eq(r_egid, t_cred->egid) && gid_eq(r_egid, t_cred->gid) && gid_eq(r_egid, t_cred->sgid);
+	if (uid_check && gid_check)
+		goto lsm;
+
+	/* By default, deny access */
+	put_task_struct(task);
+	return -EPERM;
+
+lsm:
+	/* Delegate to LSM */
+	if (ks_security_ptrace_access_check != NULL) {
+		/* Check with the installed LSMs */
+		lsm_result = ks_security_ptrace_access_check(task, PTRACE_MODE_REALCREDS);
+	} else {
+		/* We passed all checks so far, and no LSM restricts access */
+		lsm_result = 0;
+	}
+	put_task_struct(task);
+	return (lsm_result == 0) ? 0 : -EPERM;
+}
 
 
 
@@ -1780,6 +1874,9 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		arg_tid_or_tgid = (struct ioctl_tid_or_tgid *) argument;
 		TRACE("ioctl: continue(%d, %d) from %d\n", arg_tid_or_tgid->type, arg_tid_or_tgid->id, current->pid);
 
+		if ((result = check_access(arg_tid_or_tgid->id)))
+			return result;
+
 		mutex_lock(&data_mutex);
 		if (arg_tid_or_tgid->type == TID) {
 			result = __unlock_thread(current->tgid, arg_tid_or_tgid->id);
@@ -1796,6 +1893,9 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		arg_tid_or_tgid = (struct ioctl_tid_or_tgid *) argument;
 		TRACE("ioctl: suspend(%d, %d) from %d\n", arg_tid_or_tgid->type, arg_tid_or_tgid->id, current->pid);
 
+		if ((result = check_access(arg_tid_or_tgid->id)))
+			return result;
+
 		mutex_lock(&data_mutex);
 		if (arg_tid_or_tgid->type == TID) {
 			result = __lock_thread(current->tgid, arg_tid_or_tgid->id, SUSPEND_EXPLICIT);
@@ -1811,16 +1911,22 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 	case IOCTL_INSTALL_BREAKPOINT:
 		arg_breakpoint = (struct ioctl_breakpoint_identifier *) argument;
 		TRACE("ioctl: install_breakpoint(%d, %lx) from %d\n", arg_breakpoint->target, arg_breakpoint->address, current->pid);
+		if ((result = check_access(arg_breakpoint->target)))
+			return result;
 		return install_breakpoint(current->tgid, arg_breakpoint->target, arg_breakpoint->address);
 
 	case IOCTL_REMOVE_BREAKPOINT:
 		arg_breakpoint = (struct ioctl_breakpoint_identifier *) argument;
 		TRACE("ioctl: remove_breakpoint(%d, %lx) from %d\n", arg_breakpoint->target, arg_breakpoint->address, current->pid);
+		if ((result = check_access(arg_breakpoint->target)))
+			return result;
 		return remove_breakpoint(current->tgid, arg_breakpoint->target, arg_breakpoint->address);
 
 	case IOCTL_SET_STEP:
 		arg_flag = (struct ioctl_flag *) argument;
 		TRACE("ioctl: set_step(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
+		if ((result = check_access(arg_flag->target)))
+			return result;
 		if (arg_flag->value)
 			return install_step_listener(current->tgid, arg_flag->target);
 		else
@@ -1828,6 +1934,8 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 
 	case IOCTL_SET_EVENT_MASK:
 		arg_flag = (struct ioctl_flag *) argument;
+		if ((result = check_access(arg_flag->target)))
+			return result;
 		TRACE("ioctl: set_event_mask(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
 		return set_event_mask(current->tgid, arg_flag->target, arg_flag->value);
 
@@ -1859,6 +1967,9 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 	case IOCTL_WAIT_FOR:
 		arg_enumeration = (struct ioctl_enumeration *) argument;
 		TRACE("ioctl: wait_for(%d) from %d\n", arg_enumeration->target, current->pid);
+
+		if ((result = check_access(arg_enumeration->target)))
+			return result;
 
 		for (;;) {
 			/* Check whether to suspend */
@@ -1904,41 +2015,57 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 	case IOCTL_STATUS:
 		arg_enumeration = (struct ioctl_enumeration *) argument;
 		TRACE("ioctl: read_status(%d) from %d\n", arg_enumeration->target, current->pid);
+		if ((result = check_access(arg_enumeration->target)))
+			return result;
 		return read_status(current->tgid, arg_enumeration);
 
 	case IOCTL_ENUMERATE_THREADS:
 		arg_enumeration = (struct ioctl_enumeration *) argument;
 		TRACE("ioctl: enumerate_threads(%d) from %d\n", arg_enumeration->target, current->pid);
+		if ((result = check_access(arg_enumeration->target)))
+			return result;
 		return enumerate_threads(arg_enumeration);
 
 	case IOCTL_SUSPEND_REASON:
 		arg_flag = (struct ioctl_flag *) argument;
 		TRACE("ioctl: suspend_reason(%d) from %d\n", arg_flag->target, current->pid);
+		if ((result = check_access(arg_flag->target)))
+			return result;
 		return suspend_reason(current->tgid, arg_flag);
 
 	case IOCTL_READ_MEMORY:
 		arg_cpy = (struct ioctl_cpy *) argument;
 		//TRACE("ioctl: read_memory(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
+		if ((result = check_access(arg_cpy->target)))
+			return result;
 		return copy_memory(arg_cpy->target, arg_cpy->which, arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_TO_USERSPACE);
 
 	case IOCTL_READ_AUXV:
 		arg_cpy = (struct ioctl_cpy *) argument;
 		//TRACE("ioctl: read_auxv(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
+		if ((result = check_access(arg_cpy->target)))
+			return result;
 		return read_auxv(arg_cpy->target, arg_cpy->size, (char __user *) arg_cpy->buffer);
 
 	case IOCTL_WRITE_MEMORY:
 		arg_cpy = (struct ioctl_cpy *) argument;
 		TRACE("ioctl: write_memory(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
+		if ((result = check_access(arg_cpy->target)))
+			return result;
 		return copy_memory(arg_cpy->target, arg_cpy->which, arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_FROM_USERSPACE);
 
 	case IOCTL_READ_REGISTERS:
 		arg_cpy = (struct ioctl_cpy *) argument;
 		TRACE("ioctl: read_registers(%d, %lx) from %d\n", arg_cpy->target, arg_cpy->which, current->pid);
+		if ((result = check_access(arg_cpy->target)))
+			return result;
 		return copy_registers(arg_cpy->target, arg_cpy->which, &arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_TO_USERSPACE);
 
 	case IOCTL_WRITE_REGISTERS:
 		arg_cpy = (struct ioctl_cpy *) argument;
 		TRACE("ioctl: write_registers(%d, %lx) from %d\n", arg_cpy->target, arg_cpy->which, current->pid);
+		if ((result = check_access(arg_cpy->target)))
+			return result;
 		return copy_registers(arg_cpy->target, arg_cpy->which, &arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_FROM_USERSPACE);
 
 	default:
@@ -2219,6 +2346,13 @@ static struct cdev   device;
 #define DEVICE_FIRST_MINOR 0
 #define DEVICE_MINOR_COUNT 1
 
+static char *device_node(struct device *dev, umode_t *mode)
+{
+	if (mode != NULL)
+		*mode = 0666;
+	return NULL;
+}
+
 
 
 /* Module initialization and cleanup */
@@ -2259,6 +2393,7 @@ static int __init initialize(void)
 		unregister_chrdev_region(first_device, DEVICE_MINOR_COUNT);
 		return -ENODEV;
 	}
+	device_class->devnode = device_node; /* This will set the device to mode 0666 (-rw-rw-rw-) */
 	if (device_create(device_class, NULL, first_device, NULL, DEVICE_FILE_NAME) == NULL) {
 		class_destroy(device_class);
 		unregister_chrdev_region(first_device, DEVICE_MINOR_COUNT);
@@ -2283,9 +2418,13 @@ static int __init initialize(void)
 	ks_user_disable_single_step = (void (*)(struct task_struct *)) kallsyms_lookup_name("user_disable_single_step");
 	ks_get_signal = (int (*)(struct ksignal *)) kallsyms_lookup_name("get_signal");
 	ks_dequeue_signal = (int (*)(struct task_struct *, sigset_t *, siginfo_t *)) kallsyms_lookup_name("dequeue_signal");
+	ks_security_ptrace_access_check = (int (*)(struct task_struct *, unsigned int)) kallsyms_lookup_name("security_ptrace_access_check");
 
 	if (ks_wait_task_inactive == NULL || ks_user_enable_single_step == NULL || ks_user_disable_single_step == NULL || ks_get_signal == NULL || ks_dequeue_signal == NULL)
 		return -ENOENT;
+
+	if (ks_security_ptrace_access_check == NULL)
+		printk(KERN_WARNING "Cannot delegate access checks to security modules\n");
 
 	/* Register signal intercept */
 	signal_probe.addr = (kprobe_opcode_t *) ks_get_signal;

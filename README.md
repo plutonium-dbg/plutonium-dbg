@@ -43,12 +43,16 @@ dbg.continue_thread(pid)
 
 #### GDB
 
-While the kernel module is loaded, you can use our GDB remote server to interact with plutonium-dbg through a GDB client. Simply start the program by launching `gdbserver.py <program>`.
+While the kernel module is loaded, you can use our GDB remote server to interact with plutonium-dbg through a GDB client.
+Simply start the program by launching either `gdbserver.py --tcp <port> <program>` or `gdbserver.py --unix <socket_name> <program>`.
 
 To connect to a GDB server running on the VM, use the following commands from  your host GDB (this allows you to keep any of your custom settings, including plugins such as [pwndbg](https://github.com/pwndbg/pwndbg)):
 
-    set target-architecture i386:x86_64
-    target remote localhost:1337
+First set the architecture you want to debug with e.g. `set target-architecture i386:x86_64`. Once we implement the `vFile` extensions, this will no longer be necessary.
+
+Then, depending on how you started the server, connect either via TCP with `target remote localhost:1337` or through a Unix Socket with `target remote | socat UNIX:socket_name -`.
+
+Note that socat needs to be installed for the latter option.
 
 ## Setup
 
