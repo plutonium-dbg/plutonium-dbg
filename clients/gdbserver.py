@@ -524,6 +524,10 @@ def main(tcp_port, unix_socket, victim_command):
 
 
 if __name__ == "__main__":
+    if sys.version_info[0] < 3:
+        print("This program requires python3!")
+        exit(-1)
+
     parser = argparse.ArgumentParser(description="Let GDB debug a victim with plutonium-dbg")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--tcp', help="Use TCP with given port", metavar='PORT', type=int)
