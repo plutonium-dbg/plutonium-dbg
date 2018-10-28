@@ -55,6 +55,7 @@ static void (*ks_user_enable_single_step)(struct task_struct *);
 static void (*ks_user_disable_single_step)(struct task_struct *);
 static int (*ks_get_signal)(struct ksignal *);
 static int (*ks_dequeue_signal)(struct task_struct *, sigset_t *, siginfo_t *);
+static int (*ks_security_ptrace_access_check)(struct task_struct *, unsigned int);
 
 static struct kprobe signal_probe;
 
@@ -127,6 +128,7 @@ static int check_access(pid_t target)
 	int                 uid_check;
 	int                 gid_check;
 	int                 flags;
+	int                 lsm_result;
 	bool                capable;
 	struct task_struct *task;
 	const struct cred  *t_cred;
@@ -145,7 +147,7 @@ static int check_access(pid_t target)
 
 	/* Check thread groups */
 	if (same_thread_group(current, task))
-		cleanup_and_return(0, put_task_struct(task));
+		cleanup_and_return(0, put_task_struct(task)); /* No delegation to LSM here */
 
 	/* Check global ptrace capability */
 	flags = current->flags;
@@ -154,7 +156,7 @@ static int check_access(pid_t target)
 		current->flags &= ~PF_SUPERPRIV; /* ns_capable sets PF_SUPERPRIV, reset the state of that flag */
 
 	if (capable)
-		cleanup_and_return(0, put_task_struct(task));
+		goto lsm;
 
 	/* Manually check IDs */
 	r_euid = current_euid();
@@ -163,11 +165,23 @@ static int check_access(pid_t target)
 	uid_check = uid_eq(r_euid, t_cred->euid) && uid_eq(r_euid, t_cred->uid) && uid_eq(r_euid, t_cred->suid);
 	gid_check = gid_eq(r_egid, t_cred->egid) && gid_eq(r_egid, t_cred->gid) && gid_eq(r_egid, t_cred->sgid);
 	if (uid_check && gid_check)
-		cleanup_and_return(0, put_task_struct(task));
+		goto lsm;
 
 	/* By default, deny access */
 	put_task_struct(task);
 	return -EPERM;
+
+lsm:
+	/* Delegate to LSM */
+	if (ks_security_ptrace_access_check != NULL) {
+		/* Check with the installed LSMs */
+		lsm_result = ks_security_ptrace_access_check(task, PTRACE_MODE_REALCREDS);
+	} else {
+		/* We passed all checks so far, and no LSM restricts access */
+		lsm_result = 0;
+	}
+	put_task_struct(task);
+	return (lsm_result == 0) ? 0 : -EPERM;
 }
 
 
@@ -2404,9 +2418,13 @@ static int __init initialize(void)
 	ks_user_disable_single_step = (void (*)(struct task_struct *)) kallsyms_lookup_name("user_disable_single_step");
 	ks_get_signal = (int (*)(struct ksignal *)) kallsyms_lookup_name("get_signal");
 	ks_dequeue_signal = (int (*)(struct task_struct *, sigset_t *, siginfo_t *)) kallsyms_lookup_name("dequeue_signal");
+	ks_security_ptrace_access_check = (int (*)(struct task_struct *, unsigned int)) kallsyms_lookup_name("security_ptrace_access_check");
 
 	if (ks_wait_task_inactive == NULL || ks_user_enable_single_step == NULL || ks_user_disable_single_step == NULL || ks_get_signal == NULL || ks_dequeue_signal == NULL)
 		return -ENOENT;
+
+	if (ks_security_ptrace_access_check == NULL)
+		printk(KERN_WARNING "Cannot delegate access checks to security modules\n");
 
 	/* Register signal intercept */
 	signal_probe.addr = (kprobe_opcode_t *) ks_get_signal;
