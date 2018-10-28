@@ -17,7 +17,7 @@
 #   along with this program; if not, write to the Free Software
 #   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-
+import argparse
 import ctypes
 import errno
 import logging
@@ -478,7 +478,7 @@ def _get_auxv():
     return res
 
 
-def main(program_args):
+def main(tcp_port, unix_socket, victim_command):
     global log
     global tgid
     global auxv
@@ -486,19 +486,29 @@ def main(program_args):
     logging.basicConfig(level = logging.DEBUG)
     log = logging.getLogger('')
 
-    port = 31337
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('', port))
+    if tcp_port is not None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('', tcp_port))
+    else:
+        if os.path.exists(unix_socket):
+            print("Error: socket file", unix_socket, "exists!")
+            exit(-1)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(unix_socket)
 
-    tgid = subprocess.Popen(["./launch", program_args]).pid
+
+    tgid = subprocess.Popen(["./launch"] + victim_command).pid
     mod.set_event_mask(tgid, mod.EVENT_EXEC)
     time.sleep(1) # TODO: get feedback from launch program
     os.kill(tgid, signal.SIGUSR1) # signal that we're set up
     mod.wait() # wait for exec event
     mod.set_event_mask(tgid, mod.EVENT_SUSPEND)
 
-    log.info('listening on :%d' % port)
+    if tcp_port is not None:
+        log.info('listening on :%d' % tcp_port)
+    else:
+        log.info('listening on ' + unix_socket)
     sock.listen(1)
     conn, addr = sock.accept()
     conn.setblocking(0)
@@ -514,9 +524,12 @@ def main(program_args):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Not enough arguments!")
-        print("Usage: gdbserver.py victim-program")
-        exit(-1)
+    parser = argparse.ArgumentParser(description="Let GDB debug a victim with plutonium-dbg")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--tcp', help="Use TCP with given port", metavar='PORT', type=int)
+    group.add_argument('--unix', help="Use Unix Domain Socket with given name", type=str)
+    parser.add_argument('command', help="Command to start the victim", nargs=argparse.REMAINDER)
 
-    main("".join(sys.argv[1:]))
+    args = parser.parse_args()
+
+    main(args.tcp, args.unix, args.command)
