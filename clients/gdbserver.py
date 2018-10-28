@@ -514,6 +514,11 @@ def main(program_args):
 
 
 if __name__ == "__main__":
+    if sys.version_info[0] < 3:
+        print("This program requires python3!")
+        exit(-1)
+
+
     if len(sys.argv) < 2:
         print("Not enough arguments!")
         print("Usage: gdbserver.py victim-program")
