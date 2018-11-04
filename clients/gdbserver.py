@@ -42,6 +42,7 @@ PACKET_SIZE = 4096
 log = None
 mod = debugger()
 tgid = 0
+no_ack_mode = False
 
 # A list of tuples describing the debuggee's auxiliary vector (man 3 getauxval)
 auxv = []
@@ -176,8 +177,16 @@ def send_raw(conn, msg):
         log.info('-> %r' % repr(msg))
     conn.sendall(msg)
 
+def _general_set(request):
+    global no_ack_mode
+    if request.startswith('StartNoAckMode'):
+        no_ack_mode = True
+        return 'OK'
 
-def _query(request):
+    return ''
+
+
+def _general_query(request):
     if request.startswith('Supported'):
         return _q_supported(request)
     if request.startswith('Attached'):
@@ -204,7 +213,7 @@ def _q_supported(request):
         assert_support(x)
 
     # add features only supported by the server
-    supported.extend(['qXfer:auxv:read+'])
+    supported.extend(['QStartNoAckMode+', 'qXfer:auxv:read+'])
 
     return 'PacketSize=%x;' % PACKET_SIZE + ';'.join(supported)
 
@@ -364,7 +373,8 @@ def get_active_tids(op_type):
     return [tgid]
 
 handlers = {
-    'q' : _query,
+    'q' : _general_query,
+    'Q' : _general_set,
     'm' : _memory_read,
     'M' : _memory_write,
     'z' : _breakpoint_unset,
@@ -380,6 +390,7 @@ handlers = {
 
 
 def main_loop(conn):
+    global no_ack_mode
     events = []
     last_packet = ""
     while True:
@@ -390,7 +401,8 @@ def main_loop(conn):
             send(conn, last_packet)
             continue
         if packet != "":
-            send_raw(conn, b'+')
+            if no_ack_mode == False:
+                send_raw(conn, b'+')
             if(packet == "Ctrl+C"):
                 mod.suspend_process(tgid)
                 continue
