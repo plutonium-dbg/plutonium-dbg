@@ -222,7 +222,7 @@ def _q_auxv_read(request):
     log.info('Received a "read auxiliary vector" command')
 
     off, l = map(lambda x: int(x, 16), request.split('::')[1].split(','))
-    print(off, l)
+    log.info(off, l)
 
     tmp = b''
     for a in auxv:
@@ -504,7 +504,7 @@ def main(tcp_port, unix_socket, victim_command):
         sock.bind(('', tcp_port))
     else:
         if os.path.exists(unix_socket):
-            print("Error: socket file", unix_socket, "exists!")
+            log.error("Error: socket file", unix_socket, "exists!")
             exit(-1)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(unix_socket)
@@ -537,7 +537,7 @@ def main(tcp_port, unix_socket, victim_command):
 
 if __name__ == "__main__":
     if sys.version_info[0] < 3:
-        print("This program requires python3!")
+        print("This program requires python3!", file=stderr)
         exit(-1)
 
     parser = argparse.ArgumentParser(description="Let GDB debug a victim with plutonium-dbg")
