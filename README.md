@@ -48,7 +48,7 @@ Simply start the program by launching either `gdbserver.py --tcp <port> <program
 
 To connect to a GDB server running on the VM, use the following commands from  your host GDB (this allows you to keep any of your custom settings, including plugins such as [pwndbg](https://github.com/pwndbg/pwndbg)):
 
-First set the architecture you want to debug with e.g. `set target-architecture i386:x86_64`. Once we implement the `vFile` extensions, this will no longer be necessary.
+First set the architecture you want to debug with e.g. `set architecture i386:x86_64`. Once we implement the `vFile` extensions, this will no longer be necessary.
 
 Then, depending on how you started the server, connect either via TCP with `target remote localhost:1337` or through a Unix Socket with `target remote | socat UNIX:socket_name -`.
 
