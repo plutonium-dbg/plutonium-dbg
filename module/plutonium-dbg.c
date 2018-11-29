@@ -58,6 +58,7 @@ static int (*ks_dequeue_signal)(struct task_struct *, sigset_t *, siginfo_t *);
 static int (*ks_security_ptrace_access_check)(struct task_struct *, unsigned int);
 
 static struct kprobe signal_probe;
+static bool module_unloading = false;
 
 
 
@@ -322,6 +323,8 @@ static void suspend_thread(pid_t tid)
 {
 	struct task_struct *task;
 	struct breakpoint  *bp;
+	struct pt_regs      reg_copy;
+	int                 result;
 	TRACE("suspend_thread(%d)\n", tid);
 
 	rcu_read_lock();
@@ -360,9 +363,13 @@ static void suspend_thread(pid_t tid)
 		kick_process(task); /* This forces a scheduler interrupt (see scheduler_ipi()) */
 		ks_wait_task_inactive(task, __TASK_TRACED);
 
+		/* Copy the task's registers */
+		if (copy_from_user(&reg_copy, task_pt_regs(task), sizeof(reg_copy)) != sizeof(reg_copy))
+			printk(KERN_ERR "Could not read registers for TID %d.\n", tid);
+
 		/* Set a temporary breakpoint at the instruction pointer to hand control to plutonium-dbg */
 		bp->target              = tid;
-		bp->address             = instruction_pointer(task_pt_regs(task));
+		bp->address             = instruction_pointer(&reg_copy);
 		bp->probe.inode         = NULL;
 		bp->probe.offset        = 0;
 		bp->handler.handler     = &handle_suspension_breakpoint;
@@ -374,7 +381,9 @@ static void suspend_thread(pid_t tid)
 		list_add_tail(&bp->node, &pending_suspensions);
 		mutex_unlock(&suspension_mutex);
 
-		compute_location(&bp->probe, bp->target, bp->address);
+		result = compute_location(&bp->probe, bp->target, bp->address);
+		if (result != 0)
+			printk(KERN_ERR "Could not compute location of suspension probe for TID %d at address %lx: Error %d.\n", tid, bp->address, result);
 		TRACE("suspension for TID %d, IP %lx as %lu:%lld\n", tid, bp->address, bp->probe.inode->i_ino, bp->probe.offset);
 		if (uprobe_register(bp->probe.inode, bp->probe.offset, &bp->handler) != 0)
 			printk(KERN_ERR "Could not register suspension probe for TID %d at address %lx.\n", tid, bp->address);
@@ -627,8 +636,10 @@ static void __delete_breakpoint(struct breakpoint *bp)
 		INIT_WORK(&deferred->work, delete_dead_breakpoint);
 		deferred->bp = bp;
 		queue_work(deferred_queue, &deferred->work);
+	} else {
+		/* Free the breakpoint immediately if there is no attached probe */
+		kfree(bp);
 	}
-	kfree(bp);
 }
 
 /**
@@ -1848,8 +1859,10 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 	union ioctl_argument  arg;
 	struct debugger      *dbg;
 	struct event         *evt;
+	int                   result;
 
-	int result;
+	if (READ_ONCE(module_unloading))
+		return -ENODEV;
 
 	switch (command) {
 	case IOCTL_CONTINUE:
@@ -2104,6 +2117,9 @@ static int on_release(struct inode *inode, struct file *fp)
 	/* Clean up all entries of the debugger here */
 	struct debugger        *dbg;
 
+	if (READ_ONCE(module_unloading))
+		return 0;
+
 	TRACE("on_release from TID %d, TGID %d\n", current->pid, current->tgid);
 
 	mutex_lock(&data_mutex);
@@ -2142,6 +2158,9 @@ void handle_exit(void *data __attribute__((unused)), struct task_struct *task)
 	struct event_listener  *lst;
 	union event_data        evt_data;
 	bool                    do_suspend;
+
+	if (READ_ONCE(module_unloading))
+		return;
 
 	TRACE("handle_exit(task tid: %d, task tgid: %d, exit code: %d)\n", task->pid, task->tgid, task->exit_code);
 	evt_data.exit_code = task->exit_code;
@@ -2262,6 +2281,9 @@ void handle_clone(void *data __attribute__((unused)), struct task_struct *child,
 	union event_data       evt_data;
 	bool                   do_suspend;
 
+	if (READ_ONCE(module_unloading))
+		return;
+
 	TRACE("handle_clone(parent tid: %d, new tid: %d, flags: %ld)\n", current->pid, child->pid, flags);
 
 	evt_data.clone_data.new_task_tid = child->pid;
@@ -2310,6 +2332,9 @@ void handle_exec(void *data __attribute__((unused)), struct task_struct *task, p
 	struct event_listener *lst;
 	union event_data       evt_data;
 	bool                   do_suspend;
+
+	if (READ_ONCE(module_unloading))
+		return;
 
 	TRACE("handle_exec(%d / %d, new fn: %s, new interp: %s)\n", task->tgid, tid, bprm->filename, bprm->interp);
 
@@ -2480,6 +2505,11 @@ static void __exit cleanup(void)
 	class_destroy(device_class);
 	unregister_chrdev_region(first_device, DEVICE_MINOR_COUNT);
 
+	/* Indicate to all threads that the module is unloading */
+	module_unloading = true;
+	smp_mb();
+
+	/* Acquire the mutex */
 	mutex_lock(&data_mutex);
 
 	/* Detach all debuggers */
