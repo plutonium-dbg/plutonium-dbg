@@ -448,13 +448,13 @@ def main_loop(conn):
                     if event['victim'] == tgid:
                         # Signal the process exit only if TID == TGID
                         exit_code = event['data']
-                        if exit_code & 0x80:
+                        if exit_code & 0xFF != 0:
                             # Killed by signal
                             # TODO: Check if this is correct
-                            send(conn, 'X' + hex(exit_code & 0x7F)[2:] + ';')
+                            send(conn, 'X' + hex(exit_code & 0xFF)[2:] + ';')
                         else:
                             # Exit with code
-                            send(conn, 'W' + hex(exit_code)[2:] + ';')
+                            send(conn, 'W' + hex(exit_code >> 8)[2:] + ';')
                         exit(exit_code)
                     # TODO: Send 'w' packet with thread exit info if requested with QThreadEvents
                     all_tids.remove(event['victim'])
