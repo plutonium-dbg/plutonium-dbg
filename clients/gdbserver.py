@@ -438,7 +438,7 @@ def main_loop(conn):
                 if event['victim'] in all_tids:
                     # Clone happened in a debugged thread
                     # TODO: Do we need to track the clone flags?
-                    all_tids.append(event['new_task_tid'])
+                    all_tids.append(event['data']['new_task_tid'])
                 handled_events.append(event)
             elif event['event'] == mod.EVENT_EXIT:
                 log.debug(str(all_tids) + "\n" + str(event))
