@@ -42,6 +42,7 @@ PACKET_SIZE = 4096
 log = None
 mod = debugger()
 tgid = 0
+all_tids = []
 no_ack_mode = False
 
 # A list of tuples describing the debuggee's auxiliary vector (man 3 getauxval)
@@ -432,9 +433,32 @@ def main_loop(conn):
                 else:
                     send(conn, 'S01')
                 handled_events.append(event)
+            elif event['event'] == mod.EVENT_CLONE:
+                log.debug(str(all_tids) + "\n" + str(event))
+                if event['victim'] in all_tids:
+                    # Clone happened in a debugged thread
+                    # TODO: Do we need to track the clone flags?
+                    all_tids.append(event['data']['new_task_tid'])
+                handled_events.append(event)
             elif event['event'] == mod.EVENT_EXIT:
-                # TODO: handle this appropriately
-                pass
+                log.debug(str(all_tids) + "\n" + str(event))
+                # Check if this event is valid for the current TGID
+                if event['victim'] in all_tids:
+                    # Exit happened in a debugged thread
+                    if event['victim'] == tgid:
+                        # Signal the process exit only if TID == TGID
+                        exit_code = event['data']
+                        if exit_code & 0xFF != 0:
+                            # Killed by signal
+                            # TODO: Check if this is correct
+                            send(conn, 'X' + hex(exit_code & 0xFF)[2:] + ';')
+                        else:
+                            # Exit with code
+                            send(conn, 'W' + hex(exit_code >> 8)[2:] + ';')
+                        exit(exit_code)
+                    # TODO: Send 'w' packet with thread exit info if requested with QThreadEvents
+                    all_tids.remove(event['victim'])
+                handled_events.append(event)
             else:
                 log.info('Not handling event: ' + repr(event))
                 handled_events.append(event)
@@ -493,6 +517,7 @@ def _get_auxv():
 def main(tcp_port, unix_socket, victim_command):
     global log
     global tgid
+    global all_tids
     global auxv
 
     logging.basicConfig(level = logging.DEBUG)
@@ -511,11 +536,12 @@ def main(tcp_port, unix_socket, victim_command):
 
 
     tgid = subprocess.Popen(["./launch"] + victim_command).pid
+    all_tids = [tgid]
     mod.set_event_mask(tgid, mod.EVENT_EXEC)
     time.sleep(1) # TODO: get feedback from launch program
     os.kill(tgid, signal.SIGUSR1) # signal that we're set up
     mod.wait() # wait for exec event
-    mod.set_event_mask(tgid, mod.EVENT_SUSPEND)
+    mod.set_event_mask(tgid, mod.EVENT_SUSPEND | mod.EVENT_EXIT | mod.EVENT_CLONE)
 
     if tcp_port is not None:
         log.info('listening on :%d' % tcp_port)
