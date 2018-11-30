@@ -427,14 +427,21 @@ def main_loop(conn):
         handled_events = []
         for event in events:
             if event['event'] == mod.EVENT_SUSPEND:
-                if event['data'] == 2 or event['data'] == 3:
+                if event['data'] == mod.SUSPEND_ON_BREAK or event['data'] == mod.SUSPEND_ON_SINGLE_STEP:
                     send(conn, 'T' + str(GDB_SIGNAL_TRAP).rjust(2, '0') + 'thread:' + hex(event['victim'])[2:] + ';')
+                elif event['data'] == mod.SUSPEND_ON_SIGNAL:
+                    # Do not handle suspension here. Instead, handle the signal event directly.
+                    pass
                 else:
                     send(conn, 'S01')
                 handled_events.append(event)
             elif event['event'] == mod.EVENT_EXIT:
                 # TODO: handle this appropriately
                 pass
+            elif event['event'] == mod.EVENT_SIGNAL:
+                # Received a signal
+                send(conn, 'T' + hex(event['data'])[2:].rjust(2, '0') + 'thread:' + hex(event['victim'])[2:] + ';')
+                handled_events.append(event)
             else:
                 log.info('Not handling event: ' + repr(event))
                 handled_events.append(event)

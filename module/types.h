@@ -169,6 +169,7 @@ struct event {
 	union event_data {
 		int suspension_reason; /* EVENT_SUSPEND */
 		int exit_code;         /* EVENT_EXIT */
+		int signal;            /* EVENT_SIGNAL */
 
 		/* EVENT_CLONE */
 		struct {
@@ -192,12 +193,14 @@ struct event {
 #define SUSPEND_ON_EXIT        4
 #define SUSPEND_ON_CLONE       5
 #define SUSPEND_ON_EXEC        6
+#define SUSPEND_ON_SIGNAL      7
 
 /** Event types */
 #define EVENT_SUSPEND     (1 << 0)
 #define EVENT_EXIT        (1 << 1)
 #define EVENT_CLONE       (1 << 2)
 #define EVENT_EXEC        (1 << 3)
+#define EVENT_SIGNAL      (1 << 4)
 
 
 

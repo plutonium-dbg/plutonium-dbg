@@ -63,6 +63,7 @@ class messages:
                             ("filename", ctypes.c_char * (os.statvfs("/").f_namemax + 1))]
             _fields_ = [("suspension_reason", ctypes.c_int),
                         ("exit_code",         ctypes.c_int),
+                        ("signal",            ctypes.c_int),
                         ("clone_data",        __clone),
                         ("exec_data",         __exec)]
         _fields_ = [("event",  ctypes.c_int),
@@ -78,6 +79,7 @@ class commands:
     cmd_remove_bp      = ioctl(ord("@"), 11, ioctl.W, ctypes.sizeof(messages.ioctl_breakpoint_identifier))
     cmd_set_step       = ioctl(ord("@"), 20, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
     cmd_set_event_mask = ioctl(ord("@"), 30, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
+    cmd_cancel_signal  = ioctl(ord("@"), 40, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
     cmd_wait           = ioctl(ord("@"),  0, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
     cmd_wait_for       = ioctl(ord("@"),  1, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
     cmd_events         = ioctl(ord("@"),  2, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
@@ -101,13 +103,15 @@ class debugger:
     SUSPEND_ON_EXIT        = 4
     SUSPEND_ON_CLONE       = 5
     SUSPEND_ON_EXEC        = 6
+    SUSPEND_ON_SIGNAL      = 7
 
-    EVENT_SUSPEND = 1
-    EVENT_EXIT    = 2
-    EVENT_CLONE   = 4
-    EVENT_EXEC    = 8
+    EVENT_SUSPEND =  1
+    EVENT_EXIT    =  2
+    EVENT_CLONE   =  4
+    EVENT_EXEC    =  8
+    EVENT_SIGNAL  = 16
 
-    ALL_EVENTS = EVENT_SUSPEND | EVENT_EXIT | EVENT_CLONE | EVENT_EXEC
+    ALL_EVENTS = EVENT_SUSPEND | EVENT_EXIT | EVENT_CLONE | EVENT_EXEC | EVENT_SIGNAL
 
     # IOCTL parsing
     @staticmethod
@@ -123,6 +127,8 @@ class debugger:
         elif evt["event"] == debugger.EVENT_EXEC:
             evt["data"] = { "calling_tid":  ioctl_evt.data.exec_data.calling_tid,
                             "filename": ioctl_evt.data.exec_data.filename }
+        elif evt["event"] == debugger.EVENT_SIGNAL:
+            evt["data"] = ioctl_evt.data.signal
         else:
             raise KeyError("Unknown event ID: {}".format(evt["event"]))
         return evt
@@ -242,4 +248,7 @@ class debugger:
         buf = ctypes.create_string_buffer(bits)
         info = messages.ioctl_cpy(tid, request_type, ctypes.c_void_p(ctypes.addressof(buf)), len(bits))
         commands.cmd_write_regs.send(self.device, info)
-
+    def cancel_signal(self, tid, signal):
+        info = messages.ioctl_flag(tid, signal);
+        result = commands.cmd_cancel_signal.send(self.device, info)
+        return {0: False, 1: True}[result] # This looks hacky, but is just there to error out if the result is not 0 or 1

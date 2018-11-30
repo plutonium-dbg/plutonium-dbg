@@ -1102,11 +1102,13 @@ static int remove_step_listener(pid_t debugger_tgid, pid_t victim_tid)
 }
 
 /**
- * handle_signal - Intercepts get_signal, before the signal is delivered.
+ * handle_get_signal - Intercepts get_signal, before the signal is delivered.
+ * We use this to suspend single-stepping victims 'just in time'
+ * Maybe we can do this in handle_signal in the future.
  * @probe: The kprobe at get_signal
  * @regs:  The current register set
  */
-int handle_signal(struct kprobe *probe, struct pt_regs *regs)
+int handle_get_signal(struct kprobe *probe, struct pt_regs *regs)
 {
 	int                 signr;
 	sigset_t            mask;
@@ -1172,6 +1174,50 @@ int handle_signal(struct kprobe *probe, struct pt_regs *regs)
 
 	mutex_unlock(&data_mutex);
 	return 0;
+}
+
+
+
+/* Signal manipulation */
+
+/**
+ * cancel_signal - Removes a queued signal from the specified thread
+ * @victim_tid: TID of the victim
+ * @signal:     The signal number
+ *
+ * This may or may not cancel group-wide signals if victim_tid != victim_tgid.
+ * You cannot cancel fatal signals or SIGSTOP's special effects - these happen
+ * before we even know about the signal.
+ *
+ * Returns -ESRCH if the victim does not exist.
+ * On success, returns whether a signal was dequeued
+ */
+static int cancel_signal(pid_t victim_tid, int signal)
+{
+	struct task_struct *task;
+	sigset_t            mask;
+	siginfo_t           info;
+	int                 signr;
+
+	TRACE("cancel_signal(%d, %d)\n", victim_tid, signal);
+
+	rcu_read_lock();
+	task = pid_task(find_vpid(tid), PIDTYPE_PID);
+	if (task == NULL)
+		cleanup_and_return(-ESRCH, rcu_read_unlock());
+	get_task_struct(task);
+	rcu_read_unlock();
+
+	mutex_lock(&data_mutex);
+
+	sigfillset(&mask);
+	sigdelset(&mask, signal);
+	signr = ks_dequeue_signal(task, &mask, &info);
+
+	put_task_struct(task);
+	mutex_unlock(&data_mutex);
+
+	return (signr == signal) ? 1 : 0;
 }
 
 
@@ -1837,6 +1883,7 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 #define IOCTL_REMOVE_BREAKPOINT  _IOW(IOCTL_CODE, 11, struct ioctl_breakpoint_identifier)
 #define IOCTL_SET_STEP           _IOW(IOCTL_CODE, 20, struct ioctl_flag)
 #define IOCTL_SET_EVENT_MASK     _IOW(IOCTL_CODE, 30, struct ioctl_flag)
+#define IOCTL_CANCEL_SIGNAL      _IOW(IOCTL_CODE, 40, struct ioctl_flag)
 
 #define IOCTL_WAIT               _IOWR(IOCTL_CODE,  0, struct ioctl_enumeration)
 #define IOCTL_WAIT_FOR           _IOWR(IOCTL_CODE,  1, struct ioctl_enumeration)
@@ -1938,6 +1985,13 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 			return result;
 		TRACE("ioctl: set_event_mask(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
 		return set_event_mask(current->tgid, arg_flag->target, arg_flag->value);
+
+	case IOCTL_CANCEL_SIGNAL:
+		arg_flag = (struct ioctl_flag *) argument;
+		if ((result = check_access(arg_flag->target)))
+			return result;
+		TRACE("ioctl: cancel_signal(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
+		return cancel_signal(arg_flag->target, arg_flag->value);
 
 	case IOCTL_WAIT:
 		arg_enumeration = (struct ioctl_enumeration *) argument;
@@ -2103,6 +2157,66 @@ static int on_release(struct inode *inode, struct file *fp)
 
 /* Special events */
 
+
+/**
+ * handle_signal - Intercepts signal generation (__send_signal)
+ * @data:   Arbitrary data pointer, will be NULL.
+ * @sig:    Signal number (e.g. SIGSEGV).
+ * @info:   Signal metadata.
+ * @task:   Pointer to the target task.
+ * @group:  Whether the signal is sent to the entire thread group or a specific thread.
+ * @result: Result of signal generation (see trace/events/signal.h)
+ */
+void handle_signal(void *data __attribute__((unused)), int sig, struct siginfo *info, struct task_struct *task, int group, int result)
+{
+	struct victim         *vct;
+	struct single_step    *stp;
+	struct event_listener *lst;
+	bool                   do_suspend;
+
+	TRACE("handle_signal(signal: %d, task tid: %d, task tgid: %d, group: %d, result: %d)\n", sig, task->pid, task->tgid, group, result);
+
+	/* Skip signals that were never delivered */
+	if (result != TRACE_SIGNAL_LOSE_INFO && result != TRACE_SIGNAL_DELIVERED)
+		return;
+
+	mutex_lock(&data_mutex);
+
+	/* Find the victim task */
+	vct = __victim(task->pid);
+	if (IS_ERR(vct))
+		cleanup_and_return_void(mutex_unlock(&data_mutex));
+
+	/* If this is a non-group SIGTRAP while we are single-stepping, ignore the event - do not deliver that SIGTRAP! */
+	if (!group && sig == SIGTRAP) {
+		FIND_LIST_ENTRY(stp, &vct->step_listeners, node, stp->victim_tid == task->pid);
+		if (stp != NULL) {
+			TRACE("handle_signal: Skipping SIGTRAP (single-step)");
+			cleanup_and_return_void(mutex_unlock(&data_mutex));
+		}
+	}
+
+	/* Check if anyone is listening for signals */
+	list_for_each_entry(lst, &vct->event_listeners, node) {
+		/* Wake up debuggers listening to the exit event */
+		dbg = __debugger(lst->debugger_tgid);
+		if (IS_ERR(dbg))
+			continue;
+		if (!(lst->event_mask & EVENT_SIGNAL))
+			continue;
+
+		do_suspend = true;
+		__push_event(dbg, task->pid, EVENT_SIGNAL, evt_data);
+		__lock_thread(lst->debugger_tgid, task->pid, SUSPEND_ON_SIGNAL);
+		wake_up_thread(lst->debugger_tgid);
+	}
+	
+	/* Suspend if necessary */
+	if (do_suspend)
+		__suspend_loop();
+
+	mutex_unlock(&data_mutex);
+}
 
 /**
  * handle_exit - Intercepts do_exit (task death)
@@ -2370,6 +2484,7 @@ static void maybe_register_tracepoint(struct tracepoint *tp, void *data)
 	else if (strcmp(tp->name, "sched_process_exit") == 0) initialization_error = tracepoint_probe_register(tp, (void *) handle_exit, NULL);
 	else if (strcmp(tp->name, "task_newtask") == 0)       initialization_error = tracepoint_probe_register(tp, (void *) handle_clone, NULL);
 	else if (strcmp(tp->name, "sched_process_exec") == 0) initialization_error = tracepoint_probe_register(tp, (void *) handle_exec, NULL);
+	else if (strcmp(tp->name, "signal_generate") == 0)    initialization_error = tracepoint_probe_register(tp, (void *) handle_signal, NULL);
 }
 
 /**
@@ -2382,6 +2497,7 @@ static void maybe_unregister_tracepoint(struct tracepoint *tp, void *data)
 	if      (strcmp(tp->name, "sched_process_exit") == 0) tracepoint_probe_unregister(tp, (void *) handle_exit, NULL);
 	else if (strcmp(tp->name, "task_newtask") == 0)       tracepoint_probe_unregister(tp, (void *) handle_clone, NULL);
 	else if (strcmp(tp->name, "sched_process_exec") == 0) tracepoint_probe_unregister(tp, (void *) handle_exec, NULL);
+	else if (strcmp(tp->name, "signal_generate") == 0) tracepoint_probe_unregister(tp, (void *) handle_signal, NULL);
 }
 
 static int __init initialize(void)
@@ -2428,7 +2544,7 @@ static int __init initialize(void)
 
 	/* Register signal intercept */
 	signal_probe.addr = (kprobe_opcode_t *) ks_get_signal;
-	signal_probe.pre_handler = &handle_signal;
+	signal_probe.pre_handler = &handle_get_signal;
 	initialization_error = register_kprobe(&signal_probe);
 	if (initialization_error)
 		return initialization_error;
