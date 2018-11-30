@@ -9,7 +9,7 @@ all:
 	make -C $(KERNEL) M=$(PWD) modules
 
 debug:
-	make CFLAGS_plutonium-dbg.o=-DMOD_DEBUG_ENABLE_TRACE -C $(KERNEL) M=$(PWD) modules
+	make CFLAGS_plutonium-dbg.o="-g -DMOD_DEBUG_ENABLE_TRACE" -C $(KERNEL) M=$(PWD) modules
 
 clean:
 	make -C $(KERNEL) M=$(PWD) clean

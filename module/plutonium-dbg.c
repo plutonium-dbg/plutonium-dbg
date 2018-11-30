@@ -58,6 +58,7 @@ static int (*ks_dequeue_signal)(struct task_struct *, sigset_t *, siginfo_t *);
 static int (*ks_security_ptrace_access_check)(struct task_struct *, unsigned int);
 
 static struct kprobe signal_probe;
+static bool module_unloading = false;
 
 
 
@@ -91,6 +92,8 @@ static struct kprobe signal_probe;
 			ptr = NULL; \
 	} while (0)
 
+/** Counterpart to containerof **/
+#define PTR_AT(base_addr, type, member) (((char *) base_addr) + offsetof(type, member))
 
 
 /* Access control */
@@ -320,6 +323,8 @@ static void suspend_thread(pid_t tid)
 {
 	struct task_struct *task;
 	struct breakpoint  *bp;
+	struct pt_regs      reg_copy;
+	int                 result;
 	TRACE("suspend_thread(%d)\n", tid);
 
 	rcu_read_lock();
@@ -358,9 +363,13 @@ static void suspend_thread(pid_t tid)
 		kick_process(task); /* This forces a scheduler interrupt (see scheduler_ipi()) */
 		ks_wait_task_inactive(task, __TASK_TRACED);
 
+		/* Copy the task's registers */
+		if (copy_from_user(&reg_copy, task_pt_regs(task), sizeof(reg_copy)) != sizeof(reg_copy))
+			printk(KERN_ERR "Could not read registers for TID %d.\n", tid);
+
 		/* Set a temporary breakpoint at the instruction pointer to hand control to plutonium-dbg */
 		bp->target              = tid;
-		bp->address             = instruction_pointer(task_pt_regs(task));
+		bp->address             = instruction_pointer(&reg_copy);
 		bp->probe.inode         = NULL;
 		bp->probe.offset        = 0;
 		bp->handler.handler     = &handle_suspension_breakpoint;
@@ -372,7 +381,9 @@ static void suspend_thread(pid_t tid)
 		list_add_tail(&bp->node, &pending_suspensions);
 		mutex_unlock(&suspension_mutex);
 
-		compute_location(&bp->probe, bp->target, bp->address);
+		result = compute_location(&bp->probe, bp->target, bp->address);
+		if (result != 0)
+			printk(KERN_ERR "Could not compute location of suspension probe for TID %d at address %lx: Error %d.\n", tid, bp->address, result);
 		TRACE("suspension for TID %d, IP %lx as %lu:%lld\n", tid, bp->address, bp->probe.inode->i_ino, bp->probe.offset);
 		if (uprobe_register(bp->probe.inode, bp->probe.offset, &bp->handler) != 0)
 			printk(KERN_ERR "Could not register suspension probe for TID %d at address %lx.\n", tid, bp->address);
@@ -625,8 +636,10 @@ static void __delete_breakpoint(struct breakpoint *bp)
 		INIT_WORK(&deferred->work, delete_dead_breakpoint);
 		deferred->bp = bp;
 		queue_work(deferred_queue, &deferred->work);
+	} else {
+		/* Free the breakpoint immediately if there is no attached probe */
+		kfree(bp);
 	}
-	kfree(bp);
 }
 
 /**
@@ -1614,13 +1627,13 @@ static int copy_registers(pid_t tid, int type, size_t __user *size, char __user 
 /**
  * read_status - Copies the debugger's list of suspended threads to userspace
  * @tgid: TGID of the debugger
- * @uptr: Pointer to the userspace ioctl_enumeration
+ * @uptr: Pointer to the kernel copy of the ioctl_enumeration
  *
  * Returns 0 on success.
  * Returns -EFAULT if the userspace buffer is inaccessible
  * Returns any error from __debugger.
  */
-static int read_status(pid_t tgid, struct ioctl_enumeration __user *uptr)
+static int read_status(pid_t tgid, struct ioctl_enumeration *uptr)
 {
 	struct debugger    *dbg;
 	struct thread_lock *lck;
@@ -1630,10 +1643,8 @@ static int read_status(pid_t tgid, struct ioctl_enumeration __user *uptr)
 	size_t              written;
 	TRACE("read_status(%d, %p)\n", tgid, uptr);
 
-	if (copy_from_user(&buf, &uptr->buffer, sizeof(pid_t __user *)) != 0)
-		return -EFAULT;
-	if (copy_from_user(&actual_size, &uptr->size, sizeof(size_t)) != 0)
-		return -EFAULT;
+	buf = (pid_t __user *) uptr->buffer;
+	actual_size = uptr->size;
 
 	mutex_lock(&data_mutex);
 
@@ -1649,10 +1660,8 @@ static int read_status(pid_t tgid, struct ioctl_enumeration __user *uptr)
 			if (copy_to_user(buf + written++, &lck->victim_tid, sizeof(pid_t)) != 0)
 				cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
 
-	if (copy_to_user(&uptr->size, &written, sizeof(size_t)) != 0)
-		cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
-	if (copy_to_user(&uptr->available, &counter, sizeof(size_t)) != 0)
-		cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
+	uptr->size = written;
+	uptr->available = counter;
 
 	mutex_unlock(&data_mutex);
 	return 0;
@@ -1660,13 +1669,13 @@ static int read_status(pid_t tgid, struct ioctl_enumeration __user *uptr)
 
 /**
  * enumerate_threads - Copies the PIDs of a process's threads to userspace
- * @uptr: Pointer to the userspace ioctl_enumeration
+ * @uptr: Pointer to the kernel copy of the ioctl_enumeration
  *
  * Returns 0 on success.
  * Returns -EFAULT if the userspace buffer is inaccessible
  * Returns -ESRCH if the process does not exist.
  */
-static int enumerate_threads(struct ioctl_enumeration __user *uptr)
+static int enumerate_threads(struct ioctl_enumeration *uptr)
 {
 	struct task_struct *task;
 	struct task_struct *thread;
@@ -1677,12 +1686,9 @@ static int enumerate_threads(struct ioctl_enumeration __user *uptr)
 	size_t              written;
 	TRACE("enumerate_threads(%d, %p)\n", uptr->target, uptr);
 
-	if (copy_from_user(&target, &uptr->target, sizeof(pid_t)) != 0)
-		return -EFAULT;
-	if (copy_from_user(&buf, &uptr->buffer, sizeof(pid_t __user *)) != 0)
-		return -EFAULT;
-	if (copy_from_user(&actual_size, &uptr->size, sizeof(size_t)) != 0)
-		return -EFAULT;
+	target = uptr->target;
+	buf = (pid_t __user *) uptr->buffer;
+	actual_size = uptr->size;
 
 	target = tgid_from_tid(target);
 	if (target == -ESRCH)
@@ -1702,10 +1708,8 @@ static int enumerate_threads(struct ioctl_enumeration __user *uptr)
 	}
 	rcu_read_unlock();
 
-	if (copy_to_user(&uptr->size, &written, sizeof(size_t)) != 0)
-		return -EFAULT;
-	if (copy_to_user(&uptr->available, &counter, sizeof(size_t)) != 0)
-		return -EFAULT;
+	uptr->size = written;
+	uptr->available = counter;
 
 	return 0;
 }
@@ -1713,13 +1717,13 @@ static int enumerate_threads(struct ioctl_enumeration __user *uptr)
 /**
  * suspend_reason - Copies the suspension reason of a thread to userspace
  * @debugger_tgid: TGID of the debugger making the request
- * @uptr:          Pointer to the userspace ioctl_flag
+ * @uptr:          Pointer to the kernel copy of the ioctl_flag
  *
  * Returns 0 on success.
  * Returns -EFAULT if the userspace buffer is inaccessible
  * Returns any error from __debugger.
  */
-static int suspend_reason(pid_t debugger_tgid, struct ioctl_flag __user *uptr)
+static int suspend_reason(pid_t debugger_tgid, struct ioctl_flag *uptr)
 {
 	struct debugger    *dbg;
 	struct thread_lock *lck;
@@ -1727,8 +1731,7 @@ static int suspend_reason(pid_t debugger_tgid, struct ioctl_flag __user *uptr)
 	int                 reason;
 	TRACE("suspend_reason(%d, %p)\n", debugger_tgid, uptr);
 
-	if (copy_from_user(&target, &uptr->target, sizeof(pid_t)) != 0)
-		return -EFAULT;
+	target = uptr->target;
 
 	mutex_lock(&data_mutex);
 
@@ -1741,8 +1744,7 @@ static int suspend_reason(pid_t debugger_tgid, struct ioctl_flag __user *uptr)
 	FIND_LIST_ENTRY(lck, &dbg->locks, debugger_node, lck->victim_tid == target);
 	reason = lck ? lck->reason : NOT_SUSPENDED;
 
-	if (copy_to_user(&uptr->value, &reason, sizeof(int)) != 0)
-		cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
+	uptr->value = reason;
 
 	mutex_unlock(&data_mutex);
 	return 0;
@@ -1818,13 +1820,13 @@ void __push_event(struct debugger *dbg, pid_t victim_tid, int event_id, union ev
  * __dump_event_queue - Dumps the event queue to the user
  * @filter:        Only pass on events for this victim TID. If 0, pass all events
  * @debugger_tgid: The debugger in question
- * @uptr:          Pointer to the user's ioctl_enumeration struct
+ * @uptr:          Pointer to a kernel copy of the ioctl_enumeration struct
  *
  * Returns 0 on success.
  * Returns -EFAULT if the userspace buffer is inaccessible.
  * Returns any error from __debugger.
  */
-int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumeration __user *uptr)
+int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumeration *uptr)
 {
 	struct debugger           *dbg;
 	struct ioctl_event __user *buf;
@@ -1837,10 +1839,8 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 
 	TRACE("__dump_event_queue(filter: %d, debugger_tgid: %d, uptr: %p)\n", filter, debugger_tgid, (void *) uptr);
 
-	if (copy_from_user(&buf, &uptr->buffer, sizeof(struct ioctl_event __user *)) != 0)
-		return -EFAULT;
-	if (copy_from_user(&actual_size, &uptr->size, sizeof(size_t)) != 0)
-		return -EFAULT;
+	buf = (struct ioctl_event __user *) uptr->buffer;
+	actual_size = uptr->size;
 
 	dbg = __debugger(debugger_tgid);
 	if (IS_ERR(dbg))
@@ -1863,10 +1863,8 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 
 	counter -= written; /* Because we clear the event queue, remove the written elements */
 
-	if (copy_to_user(&uptr->size, &written, sizeof(size_t)) != 0)
-		return -EFAULT;
-	if (copy_to_user(&uptr->available, &counter, sizeof(size_t)) != 0)
-		return -EFAULT;
+	uptr->size = written;
+	uptr->available = counter;
 
 	return 0;
 }
@@ -1905,96 +1903,101 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
  */
 static long on_ioctl(struct file *fp, unsigned int command, unsigned long argument)
 {
-	struct ioctl_breakpoint_identifier __user *arg_breakpoint;
-	struct ioctl_tid_or_tgid           __user *arg_tid_or_tgid;
-	struct ioctl_flag                  __user *arg_flag;
-	struct ioctl_enumeration           __user *arg_enumeration;
-	struct ioctl_cpy                   __user *arg_cpy;
+	union ioctl_argument  arg;
+	struct debugger      *dbg;
+	struct event         *evt;
+	int                   result;
 
-	struct debugger *dbg;
-	struct event    *evt;
-
-	int result;
+	if (READ_ONCE(module_unloading))
+		return -ENODEV;
 
 	switch (command) {
 	case IOCTL_CONTINUE:
-		arg_tid_or_tgid = (struct ioctl_tid_or_tgid *) argument;
-		TRACE("ioctl: continue(%d, %d) from %d\n", arg_tid_or_tgid->type, arg_tid_or_tgid->id, current->pid);
+		if (copy_from_user(&arg.arg_id, (void *) argument, sizeof(struct ioctl_tid_or_tgid)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: continue(%d, %d) from %d\n", arg.arg_id.type, arg.arg_id.id, current->pid);
 
-		if ((result = check_access(arg_tid_or_tgid->id)))
+		if ((result = check_access(arg.arg_id.id)))
 			return result;
 
 		mutex_lock(&data_mutex);
-		if (arg_tid_or_tgid->type == TID) {
-			result = __unlock_thread(current->tgid, arg_tid_or_tgid->id);
+		if (arg.arg_id.type == TID) {
+			result = __unlock_thread(current->tgid, arg.arg_id.id);
 			cleanup_and_return(result, mutex_unlock(&data_mutex));
-		} else if (arg_tid_or_tgid->type == TGID) {
-			result = __unlock_all_threads(current->tgid, arg_tid_or_tgid->id);
+		} else if (arg.arg_id.type == TGID) {
+			result = __unlock_all_threads(current->tgid, arg.arg_id.id);
 			cleanup_and_return(result, mutex_unlock(&data_mutex));
 		} else {
-			printk(KERN_ERR "Invalid ID type %u for IOCTL_CONTINUE from %d\n", (unsigned) arg_tid_or_tgid->type, current->pid);
+			printk(KERN_ERR "Invalid ID type %u for IOCTL_CONTINUE from %d\n", (unsigned) arg.arg_id.type, current->pid);
 			cleanup_and_return(-EINVAL, mutex_unlock(&data_mutex));
 		}
 
 	case IOCTL_SUSPEND:
-		arg_tid_or_tgid = (struct ioctl_tid_or_tgid *) argument;
-		TRACE("ioctl: suspend(%d, %d) from %d\n", arg_tid_or_tgid->type, arg_tid_or_tgid->id, current->pid);
+		if (copy_from_user(&arg.arg_id, (void *) argument, sizeof(struct ioctl_tid_or_tgid)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: suspend(%d, %d) from %d\n", arg.arg_id.type, arg.arg_id.id, current->pid);
 
-		if ((result = check_access(arg_tid_or_tgid->id)))
+		if ((result = check_access(arg.arg_id.id)))
 			return result;
 
 		mutex_lock(&data_mutex);
-		if (arg_tid_or_tgid->type == TID) {
-			result = __lock_thread(current->tgid, arg_tid_or_tgid->id, SUSPEND_EXPLICIT);
+		if (arg.arg_id.type == TID) {
+			result = __lock_thread(current->tgid, arg.arg_id.id, SUSPEND_EXPLICIT);
 			cleanup_and_return(result, mutex_unlock(&data_mutex));
-		} else if (arg_tid_or_tgid->type == TGID) {
-			result = __lock_all_threads(current->tgid, arg_tid_or_tgid->id, SUSPEND_EXPLICIT);
+		} else if (arg.arg_id.type == TGID) {
+			result = __lock_all_threads(current->tgid, arg.arg_id.id, SUSPEND_EXPLICIT);
 			cleanup_and_return(result, mutex_unlock(&data_mutex));
 		} else {
-			printk(KERN_ERR "Invalid ID type %u for IOCTL_SUSPEND from %d\n", (unsigned) arg_tid_or_tgid->type, current->pid);
+			printk(KERN_ERR "Invalid ID type %u for IOCTL_SUSPEND from %d\n", (unsigned) arg.arg_id.type, current->pid);
 			cleanup_and_return(-EINVAL, mutex_unlock(&data_mutex));
 		}
 
 	case IOCTL_INSTALL_BREAKPOINT:
-		arg_breakpoint = (struct ioctl_breakpoint_identifier *) argument;
-		TRACE("ioctl: install_breakpoint(%d, %lx) from %d\n", arg_breakpoint->target, arg_breakpoint->address, current->pid);
-		if ((result = check_access(arg_breakpoint->target)))
+		if (copy_from_user(&arg.arg_breakpoint, (void *) argument, sizeof(struct ioctl_breakpoint_identifier)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: install_breakpoint(%d, %lx) from %d\n", arg.arg_breakpoint.target, arg.arg_breakpoint.address, current->pid);
+		if ((result = check_access(arg.arg_breakpoint.target)))
 			return result;
-		return install_breakpoint(current->tgid, arg_breakpoint->target, arg_breakpoint->address);
+		return install_breakpoint(current->tgid, arg.arg_breakpoint.target, arg.arg_breakpoint.address);
 
 	case IOCTL_REMOVE_BREAKPOINT:
-		arg_breakpoint = (struct ioctl_breakpoint_identifier *) argument;
-		TRACE("ioctl: remove_breakpoint(%d, %lx) from %d\n", arg_breakpoint->target, arg_breakpoint->address, current->pid);
-		if ((result = check_access(arg_breakpoint->target)))
+		if (copy_from_user(&arg.arg_breakpoint, (void *) argument, sizeof(struct ioctl_breakpoint_identifier)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: remove_breakpoint(%d, %lx) from %d\n", arg.arg_breakpoint.target, arg.arg_breakpoint.address, current->pid);
+		if ((result = check_access(arg.arg_breakpoint.target)))
 			return result;
-		return remove_breakpoint(current->tgid, arg_breakpoint->target, arg_breakpoint->address);
+		return remove_breakpoint(current->tgid, arg.arg_breakpoint.target, arg.arg_breakpoint.address);
 
 	case IOCTL_SET_STEP:
-		arg_flag = (struct ioctl_flag *) argument;
-		TRACE("ioctl: set_step(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
-		if ((result = check_access(arg_flag->target)))
+		if (copy_from_user(&arg.arg_flag, (void *) argument, sizeof(struct ioctl_flag)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: set_step(%d, %d) from %d\n", arg.arg_flag.target, arg.arg_flag.value, current->pid);
+		if ((result = check_access(arg.arg_flag.target)))
 			return result;
-		if (arg_flag->value)
-			return install_step_listener(current->tgid, arg_flag->target);
+		if (arg.arg_flag.value)
+			return install_step_listener(current->tgid, arg.arg_flag.target);
 		else
-			return remove_step_listener(current->tgid, arg_flag->target);
+			return remove_step_listener(current->tgid, arg.arg_flag.target);
 
 	case IOCTL_SET_EVENT_MASK:
-		arg_flag = (struct ioctl_flag *) argument;
-		if ((result = check_access(arg_flag->target)))
+		if (copy_from_user(&arg.arg_flag, (void *) argument, sizeof(struct ioctl_flag)) != 0)
+			return -EFAULT;
+		if ((result = check_access(arg.arg_flag.target)))
 			return result;
-		TRACE("ioctl: set_event_mask(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
-		return set_event_mask(current->tgid, arg_flag->target, arg_flag->value);
+		TRACE("ioctl: set_event_mask(%d, %d) from %d\n", arg.arg_flag.target, arg.arg_flag.value, current->pid);
+		return set_event_mask(current->tgid, arg.arg_flag.target, arg.arg_flag.value);
 
 	case IOCTL_CANCEL_SIGNAL:
-		arg_flag = (struct ioctl_flag *) argument;
-		if ((result = check_access(arg_flag->target)))
+		if (copy_from_user(&arg.arg_flag, (void *) argument, sizeof(struct ioctl_flag)) != 0)
+			return -EFAULT;
+		if ((result = check_access(arg.arg_flag.target)))
 			return result;
-		TRACE("ioctl: cancel_signal(%d, %d) from %d\n", arg_flag->target, arg_flag->value, current->pid);
-		return cancel_signal(arg_flag->target, arg_flag->value);
+		TRACE("ioctl: cancel_signal(%d, %d) from %d\n", arg.arg_flag.target, arg.arg_flag.value, current->pid);
+		return cancel_signal(arg.arg_flag.target, arg.arg_flag.value);
 
 	case IOCTL_WAIT:
-		arg_enumeration = (struct ioctl_enumeration *) argument;
+		if (copy_from_user(&arg.arg_enumeration, (void *) argument, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
 		TRACE("ioctl: wait() from %d\n", current->pid);
 
 		for (;;) {
@@ -2007,7 +2010,9 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 
 			/* Return events if there are any in the queue */
 			if (!list_empty(&dbg->event_queue)) {
-				result = __dump_event_queue(0, current->tgid, arg_enumeration);
+				result = __dump_event_queue(0, current->tgid, &arg.arg_enumeration);
+				if (copy_to_user((void *) argument, &arg.arg_enumeration, sizeof(struct ioctl_enumeration)) != 0)
+					cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
 				cleanup_and_return(result, mutex_unlock(&data_mutex));
 			}
 			mutex_unlock(&data_mutex);
@@ -2019,10 +2024,11 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		return 0;
 
 	case IOCTL_WAIT_FOR:
-		arg_enumeration = (struct ioctl_enumeration *) argument;
-		TRACE("ioctl: wait_for(%d) from %d\n", arg_enumeration->target, current->pid);
+		if (copy_from_user(&arg.arg_enumeration, (void *) argument, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: wait_for(%d) from %d\n", arg.arg_enumeration.target, current->pid);
 
-		if ((result = check_access(arg_enumeration->target)))
+		if ((result = check_access(arg.arg_enumeration.target)))
 			return result;
 
 		for (;;) {
@@ -2034,9 +2040,11 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 				cleanup_and_return(PTR_ERR(dbg), mutex_unlock(&data_mutex));
 
 			/* Return events if there are any in the queue */
-			FIND_LIST_ENTRY(evt, &dbg->event_queue, node, evt->victim_tid == arg_enumeration->target);
+			FIND_LIST_ENTRY(evt, &dbg->event_queue, node, evt->victim_tid == arg.arg_enumeration.target);
 			if (evt != NULL) {
-				result = __dump_event_queue(arg_enumeration->target, current->tgid, arg_enumeration);
+				result = __dump_event_queue(arg.arg_enumeration.target, current->tgid, &arg.arg_enumeration);
+				if (copy_to_user((void *) argument, &arg.arg_enumeration, sizeof(struct ioctl_enumeration)) != 0)
+					cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
 				cleanup_and_return(result, mutex_unlock(&data_mutex));
 			}
 			mutex_unlock(&data_mutex);
@@ -2048,7 +2056,8 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		return 0;
 
 	case IOCTL_EVENTS:
-		arg_enumeration = (struct ioctl_enumeration *) argument;
+		if (copy_from_user(&arg.arg_enumeration, (void *) argument, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
 		TRACE("ioctl: events() from %d\n", current->pid);
 
 		mutex_lock(&data_mutex);
@@ -2059,68 +2068,91 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 
 		/* Return events if there are any in the queue */
 		if (!list_empty(&dbg->event_queue))
-			result = __dump_event_queue(arg_enumeration->target, current->tgid, arg_enumeration);
+			result = __dump_event_queue(arg.arg_enumeration.target, current->tgid, &arg.arg_enumeration);
 		else
-			result = arg_enumeration->size = arg_enumeration->available = 0;
+			result = arg.arg_enumeration.size = arg.arg_enumeration.available = 0;
+
+		if (copy_to_user((void *) argument, &arg.arg_enumeration, sizeof(struct ioctl_enumeration)) != 0)
+			cleanup_and_return(-EFAULT, mutex_unlock(&data_mutex));
 
 		mutex_unlock(&data_mutex);
 		return result;
 
 	case IOCTL_STATUS:
-		arg_enumeration = (struct ioctl_enumeration *) argument;
-		TRACE("ioctl: read_status(%d) from %d\n", arg_enumeration->target, current->pid);
-		if ((result = check_access(arg_enumeration->target)))
+		if (copy_from_user(&arg.arg_enumeration, (void *) argument, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: read_status(%d) from %d\n", arg.arg_enumeration.target, current->pid);
+		if ((result = check_access(arg.arg_enumeration.target)))
 			return result;
-		return read_status(current->tgid, arg_enumeration);
+		if ((result = read_status(current->tgid, &arg.arg_enumeration)))
+			return result;
+		if (copy_to_user((void *) argument, &arg.arg_enumeration, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
+		return result;
 
 	case IOCTL_ENUMERATE_THREADS:
-		arg_enumeration = (struct ioctl_enumeration *) argument;
-		TRACE("ioctl: enumerate_threads(%d) from %d\n", arg_enumeration->target, current->pid);
-		if ((result = check_access(arg_enumeration->target)))
+		if (copy_from_user(&arg.arg_enumeration, (void *) argument, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: enumerate_threads(%d) from %d\n", arg.arg_enumeration.target, current->pid);
+		if ((result = check_access(arg.arg_enumeration.target)))
 			return result;
-		return enumerate_threads(arg_enumeration);
+		if ((result = enumerate_threads(&arg.arg_enumeration)))
+			return result;
+		if (copy_to_user((void *) argument, &arg.arg_enumeration, sizeof(struct ioctl_enumeration)) != 0)
+			return -EFAULT;
+		return result;
 
 	case IOCTL_SUSPEND_REASON:
-		arg_flag = (struct ioctl_flag *) argument;
-		TRACE("ioctl: suspend_reason(%d) from %d\n", arg_flag->target, current->pid);
-		if ((result = check_access(arg_flag->target)))
+		if (copy_from_user(&arg.arg_flag, (void *) argument, sizeof(struct ioctl_flag)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: suspend_reason(%d) from %d\n", arg.arg_flag.target, current->pid);
+		if ((result = check_access(arg.arg_flag.target)))
 			return result;
-		return suspend_reason(current->tgid, arg_flag);
+		if ((result = suspend_reason(current->tgid, &arg.arg_flag)))
+			return result;
+		if (copy_to_user((void *) argument, &arg.arg_flag, sizeof(struct ioctl_flag)) != 0)
+			return -EFAULT;
+		return result;
 
 	case IOCTL_READ_MEMORY:
-		arg_cpy = (struct ioctl_cpy *) argument;
-		//TRACE("ioctl: read_memory(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
-		if ((result = check_access(arg_cpy->target)))
+		if (copy_from_user(&arg.arg_cpy, (void *) argument, sizeof(struct ioctl_cpy)) != 0)
+			return -EFAULT;
+		//TRACE("ioctl: read_memory(%d, %lx, %ld) from %d\n", arg.arg_cpy.target, arg.arg_cpy.which, arg.arg_cpy.size, current->pid); // This is *very* spammy
+		if ((result = check_access(arg.arg_cpy.target)))
 			return result;
-		return copy_memory(arg_cpy->target, arg_cpy->which, arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_TO_USERSPACE);
-
-	case IOCTL_READ_AUXV:
-		arg_cpy = (struct ioctl_cpy *) argument;
-		//TRACE("ioctl: read_auxv(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
-		if ((result = check_access(arg_cpy->target)))
-			return result;
-		return read_auxv(arg_cpy->target, arg_cpy->size, (char __user *) arg_cpy->buffer);
+		return copy_memory(arg.arg_cpy.target, arg.arg_cpy.which, arg.arg_cpy.size, (char __user *) arg.arg_cpy.buffer, COPY_TO_USERSPACE);
 
 	case IOCTL_WRITE_MEMORY:
-		arg_cpy = (struct ioctl_cpy *) argument;
-		TRACE("ioctl: write_memory(%d, %lx, %ld) from %d\n", arg_cpy->target, arg_cpy->which, arg_cpy->size, current->pid);
-		if ((result = check_access(arg_cpy->target)))
+		if (copy_from_user(&arg.arg_cpy, (void *) argument, sizeof(struct ioctl_cpy)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: write_memory(%d, %lx, %ld) from %d\n", arg.arg_cpy.target, arg.arg_cpy.which, arg.arg_cpy.size, current->pid);
+		if ((result = check_access(arg.arg_cpy.target)))
 			return result;
-		return copy_memory(arg_cpy->target, arg_cpy->which, arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_FROM_USERSPACE);
+		return copy_memory(arg.arg_cpy.target, arg.arg_cpy.which, arg.arg_cpy.size, (char __user *) arg.arg_cpy.buffer, COPY_FROM_USERSPACE);
+
+	case IOCTL_READ_AUXV:
+		if (copy_from_user(&arg.arg_cpy, (void *) argument, sizeof(struct ioctl_cpy)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: read_auxv(%d, %ld) from %d\n", arg.arg_cpy.target, arg.arg_cpy.size, current->pid);
+		if ((result = check_access(arg.arg_cpy.target)))
+			return result;
+		return read_auxv(arg.arg_cpy.target, arg.arg_cpy.size, (char __user *) arg.arg_cpy.buffer);
 
 	case IOCTL_READ_REGISTERS:
-		arg_cpy = (struct ioctl_cpy *) argument;
-		TRACE("ioctl: read_registers(%d, %lx) from %d\n", arg_cpy->target, arg_cpy->which, current->pid);
-		if ((result = check_access(arg_cpy->target)))
+		if (copy_from_user(&arg.arg_cpy, (void *) argument, sizeof(struct ioctl_cpy)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: read_registers(%d, %lx) from %d\n", arg.arg_cpy.target, arg.arg_cpy.which, current->pid);
+		if ((result = check_access(arg.arg_cpy.target)))
 			return result;
-		return copy_registers(arg_cpy->target, arg_cpy->which, &arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_TO_USERSPACE);
+		return copy_registers(arg.arg_cpy.target, arg.arg_cpy.which, (size_t __user *) PTR_AT(argument, struct ioctl_cpy, size), (char __user *) arg.arg_cpy.buffer, COPY_TO_USERSPACE);
 
 	case IOCTL_WRITE_REGISTERS:
-		arg_cpy = (struct ioctl_cpy *) argument;
-		TRACE("ioctl: write_registers(%d, %lx) from %d\n", arg_cpy->target, arg_cpy->which, current->pid);
-		if ((result = check_access(arg_cpy->target)))
+		if (copy_from_user(&arg.arg_cpy, (void *) argument, sizeof(struct ioctl_cpy)) != 0)
+			return -EFAULT;
+		TRACE("ioctl: write_registers(%d, %lx) from %d\n", arg.arg_cpy.target, arg.arg_cpy.which, current->pid);
+		if ((result = check_access(arg.arg_cpy.target)))
 			return result;
-		return copy_registers(arg_cpy->target, arg_cpy->which, &arg_cpy->size, (char __user *) arg_cpy->buffer, COPY_FROM_USERSPACE);
+		return copy_registers(arg.arg_cpy.target, arg.arg_cpy.which, (size_t __user *) PTR_AT(argument, struct ioctl_cpy, size), (char __user *) arg.arg_cpy.buffer, COPY_FROM_USERSPACE);
 
 	default:
 		return -ENOTTY;
@@ -2139,6 +2171,9 @@ static int on_release(struct inode *inode, struct file *fp)
 {
 	/* Clean up all entries of the debugger here */
 	struct debugger        *dbg;
+
+	if (READ_ONCE(module_unloading))
+		return 0;
 
 	TRACE("on_release from TID %d, TGID %d\n", current->pid, current->tgid);
 
@@ -2238,6 +2273,9 @@ void handle_exit(void *data __attribute__((unused)), struct task_struct *task)
 	struct event_listener  *lst;
 	union event_data        evt_data;
 	bool                    do_suspend;
+
+	if (READ_ONCE(module_unloading))
+		return;
 
 	TRACE("handle_exit(task tid: %d, task tgid: %d, exit code: %d)\n", task->pid, task->tgid, task->exit_code);
 	evt_data.exit_code = task->exit_code;
@@ -2358,6 +2396,9 @@ void handle_clone(void *data __attribute__((unused)), struct task_struct *child,
 	union event_data       evt_data;
 	bool                   do_suspend;
 
+	if (READ_ONCE(module_unloading))
+		return;
+
 	TRACE("handle_clone(parent tid: %d, new tid: %d, flags: %ld)\n", current->pid, child->pid, flags);
 
 	evt_data.clone_data.new_task_tid = child->pid;
@@ -2406,6 +2447,9 @@ void handle_exec(void *data __attribute__((unused)), struct task_struct *task, p
 	struct event_listener *lst;
 	union event_data       evt_data;
 	bool                   do_suspend;
+
+	if (READ_ONCE(module_unloading))
+		return;
 
 	TRACE("handle_exec(%d / %d, new fn: %s, new interp: %s)\n", task->tgid, tid, bprm->filename, bprm->interp);
 
@@ -2578,6 +2622,11 @@ static void __exit cleanup(void)
 	class_destroy(device_class);
 	unregister_chrdev_region(first_device, DEVICE_MINOR_COUNT);
 
+	/* Indicate to all threads that the module is unloading */
+	module_unloading = true;
+	smp_mb();
+
+	/* Acquire the mutex */
 	mutex_lock(&data_mutex);
 
 	/* Detach all debuggers */

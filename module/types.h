@@ -267,6 +267,17 @@ struct ioctl_flag {
 	int   value;
 };
 
+/**
+ * ioctl_argument
+ * Holds any of the ioctl argument types
+ */
+union ioctl_argument {
+	struct ioctl_tid_or_tgid           arg_id;
+	struct ioctl_enumeration           arg_enumeration;
+	struct ioctl_breakpoint_identifier arg_breakpoint;
+	struct ioctl_cpy                   arg_cpy;
+	struct ioctl_flag                  arg_flag;
+};
 
 
 /* Helper types */
