@@ -28,6 +28,8 @@
 #include <linux/tracepoint.h>
 #include <linux/uaccess.h>
 
+#include <trace/events/signal.h>
+
 #include "types.h"
 
 MODULE_LICENSE("GPL");
@@ -44,9 +46,10 @@ static void __push_event(struct debugger *dbg, pid_t victim_tid, int event_id, u
 
 static DEFINE_MUTEX(data_mutex);
 static DEFINE_MUTEX(suspension_mutex);
-static DEFINE_HASHTABLE(victims,   4);
+static DEFINE_HASHTABLE(victims, 4);
 static DEFINE_HASHTABLE(debuggers, 4);
-static DEFINE_HASHTABLE(exiting,   4);
+static DEFINE_HASHTABLE(exiting, 4);
+static DEFINE_HASHTABLE(signal_canceled, 4);
 static LIST_HEAD(pending_suspensions);
 static struct workqueue_struct *deferred_queue;
 
@@ -57,7 +60,7 @@ static int (*ks_get_signal)(struct ksignal *);
 static int (*ks_dequeue_signal)(struct task_struct *, sigset_t *, siginfo_t *);
 static int (*ks_security_ptrace_access_check)(struct task_struct *, unsigned int);
 
-static struct kprobe signal_probe;
+static struct kretprobe signal_probe;
 static bool module_unloading = false;
 
 
@@ -66,9 +69,17 @@ static bool module_unloading = false;
 
 #ifdef MOD_DEBUG_ENABLE_TRACE
 #pragma message "Tracing is enabled. Undefine MOD_DEBUG_ENABLE_TRACE for production."
-#define TRACE(...) printk(KERN_INFO "TRACE: " __VA_ARGS__)
+#define TRACE(...) printk(KERN_INFO "[TRACE]: " __VA_ARGS__)
 #else
 #define TRACE(...)
+#endif
+
+#ifdef MOD_DEBUG_ENABLE_MUTEX_TRACE
+#pragma message "Mutex tracing is enabled. Undefine MOD_DEBUG_ENABLE_MUTEX_TRACE for production."
+#define MUTEX_TRACE(message, name) printk(KERN_INFO "[MUTEX]: %s %s (TID %d on line %d in %s)\n", message, name, current->pid, __LINE__, __FUNCTION__)
+#undef mutex_lock
+#define mutex_lock(lock)           (void) (MUTEX_TRACE("Locking", #lock), mutex_lock_nested(lock, 0) /* Need to use this because mutex_lock is a macro */, MUTEX_TRACE("Locked", #lock), 0)
+#define mutex_unlock(lock)         (void) (MUTEX_TRACE("Unlocking", #lock), mutex_unlock(lock), MUTEX_TRACE("Unlocked", #lock), 0)
 #endif
 
 /** Hashes a pid_t to four bits */
@@ -94,6 +105,7 @@ static bool module_unloading = false;
 
 /** Counterpart to containerof **/
 #define PTR_AT(base_addr, type, member) (((char *) base_addr) + offsetof(type, member))
+
 
 
 /* Access control */
@@ -278,7 +290,8 @@ static void delete_dead_breakpoint(struct work_struct *work)
  */
 static void __mark_exiting(pid_t tid, bool state)
 {
-	struct exit_marker *marker;
+	struct thread_marker *marker;
+	TRACE("__mark_exiting(%d, %d)\n", tid, state);
 	if (state) {
 		hash_for_each_possible(exiting, marker, node, HASH_ID(tid))
 			if (marker->tid == tid)
@@ -304,11 +317,28 @@ static void __mark_exiting(pid_t tid, bool state)
  */
 static bool __is_exiting(pid_t tid)
 {
-	struct exit_marker *marker;
+	struct thread_marker *marker;
 	hash_for_each_possible(exiting, marker, node, HASH_ID(tid))
 		if (marker->tid == tid)
 			return true;
 	return false;
+}
+
+/**
+ * __restore_sigactions - Restores the damaged sigactions from signal_canceled
+ */
+static void __restore_sigactions(void)
+{
+	struct cancellation *cancel;
+	struct hlist_node   *tmp;
+	hash_for_each_possible_safe(signal_canceled, cancel, tmp, node, HASH_ID(current->pid)) {
+		if (cancel->tid == current->pid && cancel->state != CANCELLATION_PENDING) {
+			if (cancel->state == CANCELLATION_MUST_RESTORE)
+				cancel->action->sa.sa_handler = cancel->handler;
+			hash_del(&cancel->node);
+			kfree(cancel);
+		}
+	}
 }
 
 
@@ -434,6 +464,26 @@ static void wake_up_thread(pid_t tid)
 /* Basic data structure creation and destruction */
 
 /**
+ * __get_debugger - Returns the debugger entry for the given TGID, or NULL
+ * @debugger_tgid: TGID of the debugger
+ *
+ * Returns a pointer to the debugger entry.
+ */
+static struct debugger *__get_debugger(pid_t debugger_tgid)
+{
+	struct debugger *dbg;
+	TRACE("__get_debugger(%d)\n", debugger_tgid);
+
+	/* Return an existing entry if it exists */
+	hash_for_each_possible(debuggers, dbg, node, HASH_ID(debugger_tgid))
+		if (dbg->tgid == debugger_tgid)
+			return dbg;
+
+	/* No entry */
+	return NULL;
+}
+
+/**
  * __debugger - Returns the debugger entry for the given TGID, creating a new entry if needed
  * @debugger_tgid: TGID of the debugger
  *
@@ -446,9 +496,9 @@ static struct debugger *__debugger(pid_t debugger_tgid)
 	TRACE("__debugger(%d)\n", debugger_tgid);
 
 	/* Return an existing entry if it exists */
-	hash_for_each_possible(debuggers, dbg, node, HASH_ID(debugger_tgid))
-		if (dbg->tgid == debugger_tgid)
-			return dbg;
+	dbg = __get_debugger(debugger_tgid);
+	if (dbg != NULL)
+		return dbg;
 
 	/* Allocate space for the new entry */
 	if (!ALLOC_PTR(dbg))
@@ -467,6 +517,33 @@ static struct debugger *__debugger(pid_t debugger_tgid)
 }
 
 /**
+ * __get_victim - Returns the victim entry for the given TID, or NULL
+ * @victim_tid: TID of the victim thread (can also be a TGID)
+ *
+ * Returns a pointer to the victim entry.
+ * Returns -ESRCH if the process does not exist
+ */
+static struct victim *__get_victim(pid_t victim_tid)
+{
+	pid_t          tgid;
+	struct victim *vct;
+	TRACE("__get_victim(%d)\n", victim_tid);
+
+	/* Get the TGID */
+	tgid = tgid_from_tid(victim_tid);
+	if (tgid == -ESRCH)
+		return ERR_PTR(-ESRCH);
+
+	/* Return an existing entry if it exists */
+	hash_for_each_possible(victims, vct, node, HASH_ID(tgid))
+		if (vct->tgid == tgid)
+			return vct;
+
+	/* No entry */
+	return NULL;
+}
+
+/**
  * __victim - Returns the victim entry for the given TID, creating a new entry if needed
  * @victim_tid: TID of the victim thread (can also be a TGID, because TGID == TID for the lead thread)
  *
@@ -480,15 +557,15 @@ static struct victim *__victim(pid_t victim_tid)
 	struct victim *vct;
 	TRACE("__victim(%d)\n", victim_tid);
 
+	/* Try to get an existing victim entry */
+	vct = __get_victim(victim_tid);
+	if (vct != NULL)
+		return vct; /* Error or existing entry */
+
 	/* Get the TGID */
 	tgid = tgid_from_tid(victim_tid);
 	if (tgid == -ESRCH)
 		return ERR_PTR(-ESRCH);
-
-	/* Return an existing entry if it exists */
-	hash_for_each_possible(victims, vct, node, HASH_ID(tgid))
-		if (vct->tgid == tgid)
-			return vct;
 
 	/* Allocate space for the new entry */
 	if (!ALLOC_PTR(vct))
@@ -673,7 +750,7 @@ static void __delete_debugger(struct debugger *dbg)
 		list_del(&lck->victim_node);
 		list_del(&lck->debugger_node);
 
-		vct = __victim(lck->victim_tid);
+		vct = __get_victim(lck->victim_tid);
 		if (vct != NULL) {
 			FIND_LIST_ENTRY(duplicate, &vct->locks, victim_node, duplicate->victim_tid == lck->victim_tid);
 			if (duplicate == NULL)
@@ -691,8 +768,8 @@ static void __delete_debugger(struct debugger *dbg)
 		if (cfg->breakpoint_ref != NULL && list_empty(&cfg->breakpoint_ref->attached)) {
 			__delete_breakpoint(cfg->breakpoint_ref);
 
-			vct = __victim(cfg->breakpoint_ref->target);
-			if (IS_ERR(vct))
+			vct = __get_victim(cfg->breakpoint_ref->target);
+			if (IS_ERR(vct) || vct == NULL)
 				continue;
 			if (list_empty(&vct->breakpoints) && list_empty(&vct->locks) && list_empty(&vct->step_listeners))
 				__delete_victim(vct);
@@ -732,8 +809,8 @@ static void __suspend_loop(void)
 		mutex_lock(&data_mutex);
 
 		/* Check for locks */
-		vct = __victim(current->tgid);
-		if (IS_ERR(vct) || list_empty(&vct->locks))
+		vct = __get_victim(current->tgid);
+		if (IS_ERR(vct) || vct == NULL || list_empty(&vct->locks))
 			return;
 		FIND_LIST_ENTRY(lck, &vct->locks, victim_node, lck->victim_tid == current->pid);
 		if (lck == NULL)
@@ -900,7 +977,7 @@ static int __lock_all_threads(pid_t debugger_tgid, pid_t victim_tgid, int reason
  * Returns 0 on success.
  * Returns -EAGAIN if there is no such lock.
  * Returns -ENOMEM if allocation fails.
- * Returns any error from __debugger or __victim.
+ * Returns any error from __get_debugger or __get_victim.
  */
 static int __unlock_thread(pid_t debugger_tgid, pid_t victim_tid)
 {
@@ -910,12 +987,16 @@ static int __unlock_thread(pid_t debugger_tgid, pid_t victim_tid)
 	TRACE("unlock_thread(%d, %d)\n", debugger_tgid, victim_tid);
 
 	/* Get the victim entry */
-	vct = __victim(victim_tid);
+	vct = __get_victim(victim_tid);
+	if (vct == NULL)
+		return -EAGAIN;
 	if (IS_ERR(vct))
 		return PTR_ERR(vct);
 
 	/* Get the debugger corresponding to that TGID */
-	dbg = __debugger(debugger_tgid);
+	dbg = __get_debugger(debugger_tgid);
+	if (dbg == NULL)
+		return -EAGAIN;
 	if (IS_ERR(dbg))
 		return PTR_ERR(dbg);
 
@@ -944,7 +1025,7 @@ static int __unlock_thread(pid_t debugger_tgid, pid_t victim_tid)
  *
  * Returns 0 on success.
  * Returns -ENOMEM on allocation failure.
- * Returns any error from __debugger or __victim.
+ * Returns any error from __get_debugger or __get_victim.
  */
 static int __unlock_all_threads(pid_t debugger_tgid, pid_t victim_tgid)
 {
@@ -959,12 +1040,16 @@ static int __unlock_all_threads(pid_t debugger_tgid, pid_t victim_tgid)
 	INIT_LIST_HEAD(&removed);
 
 	/* Get the debugger corresponding to that TGID */
-	dbg = __debugger(debugger_tgid);
+	dbg = __get_debugger(debugger_tgid);
+	if (dbg == NULL)
+		return 0;
 	if (IS_ERR(dbg))
 		return PTR_ERR(dbg);
 
 	/* Get the victim entry */
-	vct = __victim(victim_tgid);
+	vct = __get_victim(victim_tgid);
+	if (dbg == NULL)
+		return 0;
 	if (IS_ERR(vct))
 		return PTR_ERR(vct);
 
@@ -1067,7 +1152,7 @@ static int install_step_listener(pid_t debugger_tgid, pid_t victim_tid)
  * Returns -ENOENT if the target step listener does not exist.
  * Returns -ESRCH if the target thread does not exist.
  * Returns -EOWNERDEAD if the victim is currently exiting.
- * Returns any error from __victim.
+ * Returns any error from __get_victim.
  */
 static int remove_step_listener(pid_t debugger_tgid, pid_t victim_tid)
 {
@@ -1079,7 +1164,9 @@ static int remove_step_listener(pid_t debugger_tgid, pid_t victim_tid)
 	mutex_lock(&data_mutex);
 
 	/* Get the victim */
-	vct = __victim(victim_tid);
+	vct = __get_victim(victim_tid);
+	if (vct == NULL)
+		cleanup_and_return(-ENOENT, mutex_unlock(&data_mutex));
 	if (IS_ERR(vct))
 		cleanup_and_return(PTR_ERR(vct), mutex_unlock(&data_mutex));
 	if (__is_exiting(victim_tid))
@@ -1116,26 +1203,26 @@ static int remove_step_listener(pid_t debugger_tgid, pid_t victim_tid)
 
 /**
  * handle_get_signal - Intercepts get_signal, before the signal is delivered.
- * We use this to suspend single-stepping victims 'just in time'
- * Maybe we can do this in handle_signal in the future.
- * @probe: The kprobe at get_signal
+ * We use this to suspend single-stepping victims 'just in time'.
+ * @probe: The kretprobe_instance at get_signal
  * @regs:  The current register set
  */
-int handle_get_signal(struct kprobe *probe, struct pt_regs *regs)
+int handle_get_signal(struct kretprobe_instance *probe, struct pt_regs *regs)
 {
 	int                 signr;
 	sigset_t            mask;
 	siginfo_t           info;
 	struct victim      *vct;
 	struct single_step *stp;
-	struct thread_lock *lck;
 
-	TRACE("on_signal of <%d>\n", current->pid);
+	TRACE("handle_get_signal(tid: %d)\n", current->pid);
 
 	mutex_lock(&data_mutex);
 
 	/* Get victim */
-	vct = __victim(current->tgid);
+	vct = __get_victim(current->tgid);
+	if (vct == NULL)
+		cleanup_and_return(0, mutex_unlock(&data_mutex));
 	if (IS_ERR(vct))
 		cleanup_and_return(0, mutex_unlock(&data_mutex));
 
@@ -1145,9 +1232,15 @@ int handle_get_signal(struct kprobe *probe, struct pt_regs *regs)
 		cleanup_and_return(0, mutex_unlock(&data_mutex));
 
 	/* We *are* single-stepping - intercept any SIGTRAP */
+
+	spin_lock_irq(&current->sighand->siglock);
+
 	sigfillset(&mask);
 	sigdelset(&mask, SIGTRAP);
 	signr = ks_dequeue_signal(current, &mask, &info);
+
+	spin_unlock_irq(&current->sighand->siglock);
+
 	if (signr != SIGTRAP)
 		cleanup_and_return(0, mutex_unlock(&data_mutex));
 
@@ -1164,27 +1257,23 @@ int handle_get_signal(struct kprobe *probe, struct pt_regs *regs)
 		}
 	}
 
+	/* Suspend until unlock */
+	__suspend_loop();
+
 	mutex_unlock(&data_mutex);
+	return 0;
+}
 
-	/* While we are locked, keep suspending the current thread explicitly, then reschedule. */
-	for (;;) {
-		mutex_lock(&data_mutex);
-
-		/* Check for locks */
-		vct = __victim(current->tgid);
-		if (IS_ERR(vct) || list_empty(&vct->locks))
-			break;
-		FIND_LIST_ENTRY(lck, &vct->locks, victim_node, lck->victim_tid == current->pid);
-		if (lck == NULL)
-			break;
-
-		mutex_unlock(&data_mutex);
-
-		/* Suspend and reschedule */
-		suspend_thread(current->pid);
-		schedule();
-	}
-
+/**
+ * handle_get_signal - Intercepts get_signal before it returns.
+ * We use this to clean up the mess that handle_signal left behind.
+ * @probe: The kretprobe_instance at get_signal
+ * @regs:  The current register set
+ */
+int handle_get_signal_return(struct kretprobe_instance *probe, struct pt_regs *regs)
+{
+	mutex_lock(&data_mutex);
+	__restore_sigactions();
 	mutex_unlock(&data_mutex);
 	return 0;
 }
@@ -1195,42 +1284,60 @@ int handle_get_signal(struct kprobe *probe, struct pt_regs *regs)
 
 /**
  * cancel_signal - Removes a queued signal from the specified thread
+ * @debugger_tgid: TGID of the debugger making the request
  * @victim_tid: TID of the victim
- * @signal:     The signal number
  *
- * This may or may not cancel group-wide signals if victim_tid != victim_tgid.
- * You cannot cancel fatal signals or SIGSTOP's special effects - these happen
- * before we even know about the signal.
+ * This only has an effect if the thread is currently suspended by the debugger
+ * in handle_signal. Then, it cancels that specific signal.
  *
- * Returns -ESRCH if the victim does not exist.
- * On success, returns whether a signal was dequeued
+ * You may not be able to cancel fatal signals or SIGSTOP's special effects;
+ * these happen before we even know about the signal.
+ *
+ * Returns any error from __get_victim.
+ * Returns -ENOMEM on allocation failure.
+ * Returns -EAGAIN if the thread is not suspended on a signal.
+ * Returns -EOWNERDEAD if the thread is currently exiting.
+ * Returns 0 on success.
  */
-static int cancel_signal(pid_t victim_tid, int signal)
+static int cancel_signal(pid_t debugger_tgid, pid_t victim_tid)
 {
-	struct task_struct *task;
-	sigset_t            mask;
-	siginfo_t           info;
-	int                 signr;
+	struct victim       *vct;
+	struct thread_lock  *lck;
+	struct cancellation *cancel;
 
-	TRACE("cancel_signal(%d, %d)\n", victim_tid, signal);
-
-	rcu_read_lock();
-	task = pid_task(find_vpid(tid), PIDTYPE_PID);
-	if (task == NULL)
-		cleanup_and_return(-ESRCH, rcu_read_unlock());
-	get_task_struct(task);
-	rcu_read_unlock();
+	TRACE("cancel_signal(%d, %d)\n", debugger_tgid, victim_tid);
 
 	mutex_lock(&data_mutex);
 
-	sigfillset(&mask);
-	sigdelset(&mask, signal);
-	signr = ks_dequeue_signal(task, &mask, &info);
+	if (__is_exiting(victim_tid))
+		return -EOWNERDEAD;
 
-	put_task_struct(task);
+	/* Get victim */
+	vct = __get_victim(victim_tid);
+	if (IS_ERR(vct))
+		cleanup_and_return(PTR_ERR(vct), mutex_unlock(&data_mutex));
+	if (vct == NULL)
+		cleanup_and_return(-EAGAIN, mutex_unlock(&data_mutex));
+
+	/* Check that the thread is locked with SUSPEND_ON_SIGNAL */
+	FIND_LIST_ENTRY(lck, &vct->locks, victim_node, lck->debugger_tgid == debugger_tgid && lck->reason == SUSPEND_ON_SIGNAL);
+	if (lck == NULL)
+		cleanup_and_return(-EAGAIN, mutex_unlock(&data_mutex));
+
+	/* Check if the signal is already canceled */
+	hash_for_each_possible(signal_canceled, cancel, node, HASH_ID(victim_tid))
+		if (cancel->tid == victim_tid)
+			cleanup_and_return(0, mutex_unlock(&data_mutex));
+
+	/* Cancel the signal */
+	if (!ALLOC_PTR(cancel))
+		cleanup_and_return(-ENOMEM, mutex_unlock(&data_mutex));
+	cancel->tid = victim_tid;
+	cancel->state = CANCELLATION_PENDING;
+	hash_add(signal_canceled, &cancel->node, HASH_ID(victim_tid));
+
 	mutex_unlock(&data_mutex);
-
-	return (signr == signal) ? 1 : 0;
+	return 0;
 }
 
 
@@ -1311,7 +1418,9 @@ static int remove_breakpoint(pid_t debugger_tgid, pid_t victim_tid, addr_t addr)
 	mutex_lock(&data_mutex);
 
 	/* Get debugger and breakpoint */
-	dbg = __debugger(debugger_tgid);
+	dbg = __get_debugger(debugger_tgid);
+	if (dbg == NULL)
+		cleanup_and_return(-ENOENT, mutex_unlock(&data_mutex));
 	if (IS_ERR(dbg))
 		cleanup_and_return(PTR_ERR(dbg), mutex_unlock(&data_mutex));
 
@@ -1333,8 +1442,8 @@ static int remove_breakpoint(pid_t debugger_tgid, pid_t victim_tid, addr_t addr)
 	if (list_empty(&bp->attached)) {
 		__delete_breakpoint(bp);
 
-		vct = __victim(victim_tid);
-		if (!IS_ERR(vct) && list_empty(&vct->breakpoints) && list_empty(&vct->locks) && list_empty(&vct->step_listeners))
+		vct = __get_victim(victim_tid);
+		if (!IS_ERR(vct) && vct != NULL && list_empty(&vct->breakpoints) && list_empty(&vct->locks) && list_empty(&vct->step_listeners))
 			__delete_victim(vct);
 	}
 	if (list_empty(&dbg->breakpoints) && list_empty(&dbg->locks))
@@ -1359,8 +1468,8 @@ static int handle_breakpoint(struct uprobe_consumer *self, struct pt_regs *regs)
 	mutex_lock(&data_mutex);
 
 	/* Get the victim */
-	vct = __victim(current->tgid);
-	if (IS_ERR(vct) || list_empty(&vct->breakpoints))
+	vct = __get_victim(current->tgid);
+	if (IS_ERR(vct) || vct == NULL || list_empty(&vct->breakpoints))
 		cleanup_and_return(0, mutex_unlock(&data_mutex));
 
 	/* Find the breakpoint */
@@ -1423,8 +1532,8 @@ static int handle_suspension_breakpoint(struct uprobe_consumer *self, struct pt_
 		cleanup_and_return(0, mutex_unlock(&data_mutex));
 
 	list_for_each_entry(lck, &vct->locks, victim_node) {
-		dbg = __debugger(lck->debugger_tgid);
-		if (IS_ERR(dbg))
+		dbg = __get_debugger(lck->debugger_tgid);
+		if (IS_ERR(dbg) || dbg == NULL)
 			continue;
 		__push_event(dbg, current->pid, EVENT_SUSPEND, evt_data);
 	}
@@ -1767,6 +1876,7 @@ static int suspend_reason(pid_t debugger_tgid, struct ioctl_flag *uptr)
 int set_event_mask(pid_t debugger_tgid, pid_t victim_tid, int event_mask)
 {
 	struct victim         *vct;
+	struct debugger       *dbg;
 	struct event_listener *lst;
 	TRACE("set_event_mask(debugger = %d, victim = %d, mask = %x)\n", debugger_tgid, victim_tid, event_mask);
 
@@ -1776,6 +1886,11 @@ int set_event_mask(pid_t debugger_tgid, pid_t victim_tid, int event_mask)
 	vct = __victim(victim_tid);
 	if (IS_ERR(vct))
 		cleanup_and_return(PTR_ERR(vct), mutex_unlock(&data_mutex));
+
+	/* Allocate the debugger if it does not exist yet */
+	dbg = __debugger(debugger_tgid);
+	if (IS_ERR(dbg))
+		cleanup_and_return(PTR_ERR(dbg), mutex_unlock(&data_mutex));
 
 	/* Find the event mask entry */
 	FIND_LIST_ENTRY(lst, &vct->event_listeners, node, lst->debugger_tgid == debugger_tgid);
@@ -1881,7 +1996,7 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 #define IOCTL_REMOVE_BREAKPOINT  _IOW(IOCTL_CODE, 11, struct ioctl_breakpoint_identifier)
 #define IOCTL_SET_STEP           _IOW(IOCTL_CODE, 20, struct ioctl_flag)
 #define IOCTL_SET_EVENT_MASK     _IOW(IOCTL_CODE, 30, struct ioctl_flag)
-#define IOCTL_CANCEL_SIGNAL      _IOW(IOCTL_CODE, 40, struct ioctl_flag)
+#define IOCTL_CANCEL_SIGNAL      _IOW(IOCTL_CODE, 40, struct ioctl_tid_or_tgid)
 
 #define IOCTL_WAIT               _IOWR(IOCTL_CODE,  0, struct ioctl_enumeration)
 #define IOCTL_WAIT_FOR           _IOWR(IOCTL_CODE,  1, struct ioctl_enumeration)
@@ -1988,12 +2103,12 @@ static long on_ioctl(struct file *fp, unsigned int command, unsigned long argume
 		return set_event_mask(current->tgid, arg.arg_flag.target, arg.arg_flag.value);
 
 	case IOCTL_CANCEL_SIGNAL:
-		if (copy_from_user(&arg.arg_flag, (void *) argument, sizeof(struct ioctl_flag)) != 0)
+		if (copy_from_user(&arg.arg_id, (void *) argument, sizeof(struct ioctl_tid_or_tgid)) != 0)
 			return -EFAULT;
-		if ((result = check_access(arg.arg_flag.target)))
+		TRACE("ioctl: cancel_signal(%d) from %d\n", arg.arg_id.id, current->pid);
+		if ((result = check_access(arg.arg_id.id)))
 			return result;
-		TRACE("ioctl: cancel_signal(%d, %d) from %d\n", arg.arg_flag.target, arg.arg_flag.value, current->pid);
-		return cancel_signal(arg.arg_flag.target, arg.arg_flag.value);
+		return cancel_signal(current->tgid, arg.arg_id.id);
 
 	case IOCTL_WAIT:
 		if (copy_from_user(&arg.arg_enumeration, (void *) argument, sizeof(struct ioctl_enumeration)) != 0)
@@ -2179,7 +2294,9 @@ static int on_release(struct inode *inode, struct file *fp)
 
 	mutex_lock(&data_mutex);
 
-	dbg = __debugger(current->tgid);
+	dbg = __get_debugger(current->tgid);
+	if (dbg == NULL)
+		cleanup_and_return(0, mutex_unlock(&data_mutex));
 	if (IS_ERR(dbg))
 		cleanup_and_return(PTR_ERR(dbg), mutex_unlock(&data_mutex));
 	__delete_debugger(dbg);
@@ -2194,62 +2311,97 @@ static int on_release(struct inode *inode, struct file *fp)
 
 
 /**
- * handle_signal - Intercepts signal generation (__send_signal)
+ * handle_signal - Intercepts signal delivery (also in get_signal)
+ *
+ * Note that this differs from handle_get_signal in that we have access to the
+ * actual signal information here. handle_get_signal intercepts the function
+ * before the signal is even dequeued, which allows us to handle single-stepping
+ * before ptrace gets a chance to do so. Here, ptrace is already done with the
+ * signal, and the parent has been sent a SIGCHLD. We need to prevent this for
+ * single-stepping SIGTRAPs, which is why we need two separate handlers.
+ * In addition, this function will be called for each signal separately, which
+ * is not guaranteed for handle_get_signal.
+ *
  * @data:   Arbitrary data pointer, will be NULL.
  * @sig:    Signal number (e.g. SIGSEGV).
  * @info:   Signal metadata.
- * @task:   Pointer to the target task.
- * @group:  Whether the signal is sent to the entire thread group or a specific thread.
- * @result: Result of signal generation (see trace/events/signal.h)
+ * @action: The configured action.
  */
-void handle_signal(void *data __attribute__((unused)), int sig, struct siginfo *info, struct task_struct *task, int group, int result)
+void handle_signal(void *data __attribute__((unused)), int sig, struct siginfo *info, struct k_sigaction *action)
 {
 	struct victim         *vct;
-	struct single_step    *stp;
+	struct debugger       *dbg;
 	struct event_listener *lst;
+	struct cancellation   *cancel;
+	union event_data       evt_data;
 	bool                   do_suspend;
+	bool                   do_cancel;
 
-	TRACE("handle_signal(signal: %d, task tid: %d, task tgid: %d, group: %d, result: %d)\n", sig, task->pid, task->tgid, group, result);
-
-	/* Skip signals that were never delivered */
-	if (result != TRACE_SIGNAL_LOSE_INFO && result != TRACE_SIGNAL_DELIVERED)
+	if (READ_ONCE(module_unloading))
 		return;
 
+	TRACE("handle_signal(%d) in PID %d", sig, current->pid);
+
+	do_suspend = false;
+	evt_data.signal = sig;
+
+	/* Unlock the signal lock before obtaining the mutex */
+	spin_unlock_irq(&current->sighand->siglock);
 	mutex_lock(&data_mutex);
 
-	/* Find the victim task */
-	vct = __victim(task->pid);
-	if (IS_ERR(vct))
-		cleanup_and_return_void(mutex_unlock(&data_mutex));
+	/* Restore any sigactions we previously destroyed */
+	__restore_sigactions();
 
-	/* If this is a non-group SIGTRAP while we are single-stepping, ignore the event - do not deliver that SIGTRAP! */
-	if (!group && sig == SIGTRAP) {
-		FIND_LIST_ENTRY(stp, &vct->step_listeners, node, stp->victim_tid == task->pid);
-		if (stp != NULL) {
-			TRACE("handle_signal: Skipping SIGTRAP (single-step)");
-			cleanup_and_return_void(mutex_unlock(&data_mutex));
-		}
-	}
+	/* Find the victim task */
+	vct = __get_victim(current->tgid);
+	if (IS_ERR(vct) || vct == NULL)
+		cleanup_and_return_void(mutex_unlock(&data_mutex), spin_lock_irq(&current->sighand->siglock));
 
 	/* Check if anyone is listening for signals */
 	list_for_each_entry(lst, &vct->event_listeners, node) {
-		/* Wake up debuggers listening to the exit event */
-		dbg = __debugger(lst->debugger_tgid);
-		if (IS_ERR(dbg))
+		/* Wake up debuggers listening to the event */
+		dbg = __get_debugger(lst->debugger_tgid);
+		TRACE("Considering debugger %d (ptr = %p)\n", lst->debugger_tgid, (void*) dbg);
+		if (IS_ERR(dbg) || dbg == NULL)
 			continue;
 		if (!(lst->event_mask & EVENT_SIGNAL))
 			continue;
 
 		do_suspend = true;
-		__push_event(dbg, task->pid, EVENT_SIGNAL, evt_data);
-		__lock_thread(lst->debugger_tgid, task->pid, SUSPEND_ON_SIGNAL);
+		__push_event(dbg, current->pid, EVENT_SIGNAL, evt_data);
+		__lock_thread(lst->debugger_tgid, current->pid, SUSPEND_ON_SIGNAL);
 		wake_up_thread(lst->debugger_tgid);
 	}
-	
+	TRACE("All debuggers done, do_suspend = %d\n", do_suspend);
+
 	/* Suspend if necessary */
 	if (do_suspend)
 		__suspend_loop();
 
+	/* Check if we need to cancel the signal */
+	do_cancel = false;
+	hash_for_each_possible(signal_canceled, cancel, node, HASH_ID(current->pid)) {
+		if (cancel->tid == current->pid) {
+			cancel->state = CANCELLATION_HANDLED;
+			do_cancel = true;
+			break;
+		}
+	}
+
+	/* Cancel the signal if it is not ignored already */
+	if (do_cancel && action->sa.sa_handler != SIG_IGN) {
+		/* Unfortunately, action->sa is the shared sigaction for the task.
+		 * Modifying it has effects on all subsequent signals.
+		 * We correct this above, or in handle_get_signal_return.
+		 */
+
+		cancel->state = CANCELLATION_MUST_RESTORE; /* Must restore this sigaction */
+		cancel->action = action;                   /* Store a pointer to the action */
+		cancel->handler = action->sa.sa_handler;   /* Store the original handler */
+		action->sa.sa_handler = SIG_IGN;           /* Force the signal handler to SIG_IGN */
+	}
+
+	spin_lock_irq(&current->sighand->siglock);
 	mutex_unlock(&data_mutex);
 }
 
@@ -2288,15 +2440,16 @@ void handle_exit(void *data __attribute__((unused)), struct task_struct *task)
 		/* This is a thread group leader exiting. */
 
 		/* If this is a debugger, remove everything. */
-		dbg = __debugger(task->tgid);
+		dbg = __get_debugger(task->tgid);
 		if (IS_ERR(dbg))
-			cleanup_and_return_void(mutex_unlock(&data_mutex));
-		__delete_debugger(dbg);
+			cleanup_and_return_void(__mark_exiting(task->pid, false), mutex_unlock(&data_mutex));
+		if (dbg != NULL)
+			__delete_debugger(dbg);
 
 		/* If this process has a victim thread, clean everything up too */
-		vct = __victim(task->pid);
-		if (IS_ERR(vct))
-			cleanup_and_return_void(mutex_unlock(&data_mutex));
+		vct = __get_victim(task->pid);
+		if (IS_ERR(vct) || vct == NULL)
+			cleanup_and_return_void(__mark_exiting(task->pid, false), mutex_unlock(&data_mutex));
 
 		/* Now clean up the victim part: Force-detach all breakpoint configs, then delete all breakpoints and listeners, and finally delete the victim */
 		list_for_each_entry_safe(bp, bp_it, &vct->breakpoints, node) {
@@ -2318,8 +2471,8 @@ void handle_exit(void *data __attribute__((unused)), struct task_struct *task)
 		}
 		list_for_each_entry(lst, &vct->event_listeners, node) {
 			/* Wake up debuggers listening to the exit event */
-			dbg = __debugger(lst->debugger_tgid);
-			if (IS_ERR(dbg))
+			dbg = __get_debugger(lst->debugger_tgid);
+			if (IS_ERR(dbg) || dbg == NULL)
 				continue;
 			if (!(lst->event_mask & EVENT_EXIT))
 				continue;
@@ -2337,9 +2490,9 @@ void handle_exit(void *data __attribute__((unused)), struct task_struct *task)
 		__delete_victim(vct);
 	} else {
 		/* This is just a thread, not the entire process. Keep debuggers alive, just clean up relevant victim stuff */
-		vct = __victim(task->pid);
-		if (IS_ERR(vct))
-			cleanup_and_return_void(mutex_unlock(&data_mutex));
+		vct = __get_victim(task->pid);
+		if (IS_ERR(vct) || vct == NULL)
+			cleanup_and_return_void(__mark_exiting(task->pid, false), mutex_unlock(&data_mutex));
 
 		/* Now clean up the victim part: Delete all thread locks and step listeners for this thread. */
 		list_for_each_entry_safe(lck, lck_it, &vct->locks, victim_node) {
@@ -2408,15 +2561,15 @@ void handle_clone(void *data __attribute__((unused)), struct task_struct *child,
 	mutex_lock(&data_mutex);
 
 	/* Get the victim entry (if any) */
-	vct = __victim(current->pid);
-	if (IS_ERR(vct))
+	vct = __get_victim(current->pid);
+	if (IS_ERR(vct) || vct == NULL)
 		cleanup_and_return_void(mutex_unlock(&data_mutex));
 
 	/* Find all attached event listeners */
 	list_for_each_entry(lst, &vct->event_listeners, node) {
 		/* Wake up debuggers listening to the clone event */
-		dbg = __debugger(lst->debugger_tgid);
-		if (IS_ERR(dbg))
+		dbg = __get_debugger(lst->debugger_tgid);
+		if (IS_ERR(dbg) || dbg == NULL)
 			continue;
 		if (!(lst->event_mask & EVENT_CLONE))
 			continue;
@@ -2460,15 +2613,15 @@ void handle_exec(void *data __attribute__((unused)), struct task_struct *task, p
 	mutex_lock(&data_mutex);
 
 	/* Get the victim entry (if any) */
-	vct = __victim(current->pid);
-	if (IS_ERR(vct))
+	vct = __get_victim(current->pid);
+	if (IS_ERR(vct) || vct == NULL)
 		cleanup_and_return_void(mutex_unlock(&data_mutex));
 
 	/* Find all attached event listeners */
 	list_for_each_entry(lst, &vct->event_listeners, node) {
 		/* Wake up debuggers listening to the clone event */
-		dbg = __debugger(lst->debugger_tgid);
-		if (IS_ERR(dbg))
+		dbg = __get_debugger(lst->debugger_tgid);
+		if (IS_ERR(dbg) || dbg == NULL)
 			continue;
 		if (!(lst->event_mask & EVENT_EXEC))
 			continue;
@@ -2528,7 +2681,7 @@ static void maybe_register_tracepoint(struct tracepoint *tp, void *data)
 	else if (strcmp(tp->name, "sched_process_exit") == 0) initialization_error = tracepoint_probe_register(tp, (void *) handle_exit, NULL);
 	else if (strcmp(tp->name, "task_newtask") == 0)       initialization_error = tracepoint_probe_register(tp, (void *) handle_clone, NULL);
 	else if (strcmp(tp->name, "sched_process_exec") == 0) initialization_error = tracepoint_probe_register(tp, (void *) handle_exec, NULL);
-	else if (strcmp(tp->name, "signal_generate") == 0)    initialization_error = tracepoint_probe_register(tp, (void *) handle_signal, NULL);
+	else if (strcmp(tp->name, "signal_deliver") == 0)     initialization_error = tracepoint_probe_register(tp, (void *) handle_signal, NULL);
 }
 
 /**
@@ -2541,7 +2694,7 @@ static void maybe_unregister_tracepoint(struct tracepoint *tp, void *data)
 	if      (strcmp(tp->name, "sched_process_exit") == 0) tracepoint_probe_unregister(tp, (void *) handle_exit, NULL);
 	else if (strcmp(tp->name, "task_newtask") == 0)       tracepoint_probe_unregister(tp, (void *) handle_clone, NULL);
 	else if (strcmp(tp->name, "sched_process_exec") == 0) tracepoint_probe_unregister(tp, (void *) handle_exec, NULL);
-	else if (strcmp(tp->name, "signal_generate") == 0) tracepoint_probe_unregister(tp, (void *) handle_signal, NULL);
+	else if (strcmp(tp->name, "signal_deliver") == 0)     tracepoint_probe_unregister(tp, (void *) handle_signal, NULL);
 }
 
 static int __init initialize(void)
@@ -2587,9 +2740,10 @@ static int __init initialize(void)
 		printk(KERN_WARNING "Cannot delegate access checks to security modules\n");
 
 	/* Register signal intercept */
-	signal_probe.addr = (kprobe_opcode_t *) ks_get_signal;
-	signal_probe.pre_handler = &handle_get_signal;
-	initialization_error = register_kprobe(&signal_probe);
+	signal_probe.kp.addr = (kprobe_opcode_t *) ks_get_signal;
+	signal_probe.entry_handler = &handle_get_signal;
+	signal_probe.handler = &handle_get_signal_return;
+	initialization_error = register_kretprobe(&signal_probe);
 	if (initialization_error)
 		return initialization_error;
 
@@ -2657,7 +2811,7 @@ static void __exit cleanup(void)
 	}
 
 	/* Remove general probes */
-	unregister_kprobe(&signal_probe);
+	unregister_kretprobe(&signal_probe);
 	for_each_kernel_tracepoint(maybe_unregister_tracepoint, NULL);
 
 	mutex_unlock(&data_mutex);

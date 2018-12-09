@@ -79,7 +79,7 @@ class commands:
     cmd_remove_bp      = ioctl(ord("@"), 11, ioctl.W, ctypes.sizeof(messages.ioctl_breakpoint_identifier))
     cmd_set_step       = ioctl(ord("@"), 20, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
     cmd_set_event_mask = ioctl(ord("@"), 30, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
-    cmd_cancel_signal  = ioctl(ord("@"), 40, ioctl.W, ctypes.sizeof(messages.ioctl_flag))
+    cmd_cancel_signal  = ioctl(ord("@"), 40, ioctl.W, ctypes.sizeof(messages.ioctl_tid_or_tgid))
     cmd_wait           = ioctl(ord("@"),  0, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
     cmd_wait_for       = ioctl(ord("@"),  1, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
     cmd_events         = ioctl(ord("@"),  2, ioctl.RW, ctypes.sizeof(messages.ioctl_enumeration))
@@ -248,7 +248,6 @@ class debugger:
         buf = ctypes.create_string_buffer(bits)
         info = messages.ioctl_cpy(tid, request_type, ctypes.c_void_p(ctypes.addressof(buf)), len(bits))
         commands.cmd_write_regs.send(self.device, info)
-    def cancel_signal(self, tid, signal):
-        info = messages.ioctl_flag(tid, signal);
-        result = commands.cmd_cancel_signal.send(self.device, info)
-        return {0: False, 1: True}[result] # This looks hacky, but is just there to error out if the result is not 0 or 1
+    def cancel_signal(self, tid):
+        info = messages.ioctl_tid_or_tgid(tid, 0)
+        commands.cmd_cancel_signal.send(self.device, info)

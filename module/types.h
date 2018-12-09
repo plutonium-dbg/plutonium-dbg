@@ -1,5 +1,6 @@
 #include <linux/hashtable.h>
 #include <linux/list.h>
+#include <linux/signal.h>
 #include <linux/types.h>
 #include <linux/uprobes.h>
 #include <linux/workqueue.h>
@@ -82,11 +83,12 @@ struct debugger {
 
 /**
  * victim - A victim process
- * @node:           Entry in the victim hash table (by TGID)
- * @tgid:           TGID of the victim
- * @breakpoints:    Breakpoints in the victim process
- * @locks:          Locks for the victim thread
- * @step_listeners: Attached single-step listeners (each is only valid for a specific TID)
+ * @node:            Entry in the victim hash table (by TGID)
+ * @tgid:            TGID of the victim
+ * @breakpoints:     Breakpoints in the victim process
+ * @locks:           Locks for the victim thread
+ * @step_listeners:  Attached single-step listeners (each is only valid for a specific TID)
+ * @event_listeners: Attached event listeners
  */
 struct victim {
 	struct hlist_node node;
@@ -98,14 +100,33 @@ struct victim {
 };
 
 /**
- * exit_marker - Marks a victim thread as exiting, blocking certain operations from running
+ * thread_marker - Marks a victim thread in a hash table.
  * @node: Entry in the hash table (by TID)
  * @tid:  TID of the victim thread
  */
-struct exit_marker {
+struct thread_marker {
 	struct hlist_node node;
 	pid_t             tid;
 };
+
+/**
+ * cancellation - Data needed to cancel a signal, but restore the sigaction (see handle_signal)
+ * @node:    Entry in a hash table
+ * @tid:     TID of the victim thread
+ * @restore: Whether we need to restore the sigaction in the first place
+ * @action:  The modified sigaction
+ * @handler: The original signal handler
+ */
+struct cancellation {
+	struct hlist_node   node;
+	pid_t               tid;
+	int                 state;
+	struct k_sigaction *action;
+	__sighandler_t      handler;
+};
+#define CANCELLATION_PENDING      0
+#define CANCELLATION_HANDLED      1
+#define CANCELLATION_MUST_RESTORE 2
 
 /**
  * thread_lock - Locks a suspended thread until it can continue
