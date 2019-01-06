@@ -11,5 +11,8 @@ all:
 debug:
 	make CFLAGS_plutonium-dbg.o="-g -DMOD_DEBUG_ENABLE_TRACE" -C $(KERNEL) M=$(PWD) modules
 
+mutexdebug:
+	make CFLAGS_plutonium-dbg.o="-g -DMOD_DEBUG_ENABLE_TRACE -DMOD_DEBUG_ENABLE_MUTEX_TRACE" -C $(KERNEL) M=$(PWD) modules
+
 clean:
 	make -C $(KERNEL) M=$(PWD) clean
