@@ -95,7 +95,7 @@ class commands:
 
 # Actual client
 class debugger:
-    # Constants (see types.h)
+    # Constants (see common.h)
     NOT_SUSPENDED          = 0
     SUSPEND_EXPLICIT       = 1
     SUSPEND_ON_BREAK       = 2
