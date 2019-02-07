@@ -124,7 +124,7 @@ namespace PLUTONIUM_DBG_NS
 	ssize_t enumerate_threads(pid_t tgid, pid_t *tid_buffer, size_t buffer_size)
 	{
 		ioctl_enumeration argument { tgid, reinterpret_cast<addr_t>(tid_buffer), buffer_size, 0 };
-		int error = ::send_ioctl(IOCTL_STATUS, &argument);
+		int error = ::send_ioctl(IOCTL_ENUMERATE_THREADS, &argument);
 		if (error < 0)
 			return error;
 		return argument.size;
