@@ -101,7 +101,7 @@ ssize_t PLUTONIUM_DBG_NAME(status)(int fd, pid_t *tid_buffer, size_t buffer_size
 ssize_t PLUTONIUM_DBG_NAME(enumerate_threads)(int fd, pid_t tgid, pid_t *tid_buffer, size_t buffer_size)
 {
 	struct ioctl_enumeration argument = { tgid, (addr_t) tid_buffer, buffer_size, 0 };
-	int error = ioctl(fd, IOCTL_STATUS, (char *) &argument);
+	int error = ioctl(fd, IOCTL_ENUMERATE_THREADS, (char *) &argument);
 	if (error < 0)
 		return error;
 	return argument.size;
