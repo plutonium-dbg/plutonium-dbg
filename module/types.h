@@ -1,3 +1,10 @@
+#ifndef PLUTONIUM_DBG_TYPES_H
+#define PLUTONIUM_DBG_TYPES_H
+
+#ifndef __KERNEL__
+#error "You should only include 'types.h' from kernel code"
+#endif
+
 #include <linux/hashtable.h>
 #include <linux/list.h>
 #include <linux/signal.h>
@@ -5,16 +12,10 @@
 #include <linux/uprobes.h>
 #include <linux/workqueue.h>
 
-/*
- * The following code uses TGID to describe the ID of a user-space process
- * (TGID in kernel-space, PID in user-space), and TID to describe the ID of
- * a user-space thread (PID in kernel-space, TID in user-space)
- */
+#include "common.h" /* Pull in shared types and constants */
 
-/**
- * addr_t - Any address in memory
- */
-typedef unsigned long addr_t;
+
+/* Internal types */
 
 /**
  * probe_location - Location of a probe underlying a breakpoint
@@ -186,118 +187,7 @@ struct event {
 	struct list_head node;
 	int              event_id;
 	pid_t            victim_tid;
-
-	union event_data {
-		int suspension_reason; /* EVENT_SUSPEND */
-		int exit_code;         /* EVENT_EXIT */
-		int signal;            /* EVENT_SIGNAL */
-
-		/* EVENT_CLONE */
-		struct {
-			pid_t         new_task_tid;
-			unsigned long clone_flags;
-		} clone_data;
-
-		/* EVENT_EXEC */
-		struct {
-			pid_t calling_tid;
-			char  filename[NAME_MAX + 1];
-		} exec_data;
-	} data;
-};
-
-/** Suspension reasons */
-#define NOT_SUSPENDED          0
-#define SUSPEND_EXPLICIT       1
-#define SUSPEND_ON_BREAK       2
-#define SUSPEND_ON_SINGLE_STEP 3
-#define SUSPEND_ON_EXIT        4
-#define SUSPEND_ON_CLONE       5
-#define SUSPEND_ON_EXEC        6
-#define SUSPEND_ON_SIGNAL      7
-
-/** Event types */
-#define EVENT_SUSPEND     (1 << 0)
-#define EVENT_EXIT        (1 << 1)
-#define EVENT_CLONE       (1 << 2)
-#define EVENT_EXEC        (1 << 3)
-#define EVENT_SIGNAL      (1 << 4)
-
-
-
-/* Communication-only types */
-
-/**
- * ioctl_tid_or_tgid
- * @id:   TID or TGID
- * @type: Indicates the type of the ID
- */
-struct ioctl_tid_or_tgid {
-	pid_t              id;
-	enum { TID, TGID } type;
-};
-
-/**
- * ioctl_enumeration
- * @target:    Target process. Whether this has any meaning depends on the IOCTL used.
- * @buffer:    Buffer of items.
- * @size:      Size of the buffer (in number of items). In the response, indicates how many items were written to the buffer.
- * @available: Number of suspended threads currently available.
- *
- * If the response size is smaller than the available size, query again with a larger buffer.
- * The type (and size) of an item is defined by the call this type is used for.
- */
-struct ioctl_enumeration {
-	pid_t  target;
-	addr_t buffer;
-	size_t size;
-	size_t available;
-};
-
-/**
- * ioctl_breakpoint_identifier
- * @target:  TGID of the target process
- * @address: Address of the breakpoint
- */
-struct ioctl_breakpoint_identifier {
-	pid_t  target;
-	addr_t address;
-};
-
-/**
- * ioctl_cpy
- * @target:  TID or TGID of the target
- * @which:   Address at which to begin copying (for memory) or type of the register set (for registers, usually NT_PRSTATUS = 1)
- * @buffer:  Pointer to userspace buffer
- * @size:    Size of the buffer that will be copied (register requests set this to the size of the full set)
- */
-struct ioctl_cpy {
-	pid_t  target;
-	addr_t which;
-	addr_t buffer;
-	size_t size;
-};
-
-/**
- * ioctl_flag
- * @target: TID or TGID of the target
- * @value:  Value of the flag
- */
-struct ioctl_flag {
-	pid_t target;
-	int   value;
-};
-
-/**
- * ioctl_argument
- * Holds any of the ioctl argument types
- */
-union ioctl_argument {
-	struct ioctl_tid_or_tgid           arg_id;
-	struct ioctl_enumeration           arg_enumeration;
-	struct ioctl_breakpoint_identifier arg_breakpoint;
-	struct ioctl_cpy                   arg_cpy;
-	struct ioctl_flag                  arg_flag;
+	union event_data data;
 };
 
 
@@ -309,9 +199,4 @@ struct dead_breakpoint {
 	struct breakpoint  *bp;
 };
 
-/** ioctl_event - Holds an event for the IOCTL buffer */
-struct ioctl_event {
-	int              event_id;
-	pid_t            victim_tid;
-	union event_data data;
-};
+#endif /* PLUTONIUM_DBG_TYPES_H */

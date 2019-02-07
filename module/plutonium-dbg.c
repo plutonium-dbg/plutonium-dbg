@@ -1575,7 +1575,7 @@ static int read_auxv(pid_t tid, size_t size, char __user *uptr)
 	if (mm == NULL)
 		cleanup_and_return(-EACCES, put_task_struct(task));
 
-	/* Copy contents of auxv to userspace if the buffer is large enough) */
+	/* Copy contents of auxv to userspace if the buffer is large enough */
 	if (size < AT_VECTOR_SIZE * sizeof(void *))
 		cleanup_and_return(-EINVAL, mmput(mm), put_task_struct(task));
 
@@ -1987,28 +1987,6 @@ int __dump_event_queue(pid_t filter, pid_t debugger_tgid, struct ioctl_enumerati
 
 
 /* Communications */
-
-#define IOCTL_CODE '@'
-
-#define IOCTL_CONTINUE           _IOW(IOCTL_CODE,  0, struct ioctl_tid_or_tgid)
-#define IOCTL_SUSPEND            _IOW(IOCTL_CODE,  1, struct ioctl_tid_or_tgid)
-#define IOCTL_INSTALL_BREAKPOINT _IOW(IOCTL_CODE, 10, struct ioctl_breakpoint_identifier)
-#define IOCTL_REMOVE_BREAKPOINT  _IOW(IOCTL_CODE, 11, struct ioctl_breakpoint_identifier)
-#define IOCTL_SET_STEP           _IOW(IOCTL_CODE, 20, struct ioctl_flag)
-#define IOCTL_SET_EVENT_MASK     _IOW(IOCTL_CODE, 30, struct ioctl_flag)
-#define IOCTL_CANCEL_SIGNAL      _IOW(IOCTL_CODE, 40, struct ioctl_tid_or_tgid)
-
-#define IOCTL_WAIT               _IOWR(IOCTL_CODE,  0, struct ioctl_enumeration)
-#define IOCTL_WAIT_FOR           _IOWR(IOCTL_CODE,  1, struct ioctl_enumeration)
-#define IOCTL_EVENTS             _IOWR(IOCTL_CODE,  2, struct ioctl_enumeration)
-#define IOCTL_STATUS             _IOWR(IOCTL_CODE, 10, struct ioctl_enumeration)
-#define IOCTL_ENUMERATE_THREADS  _IOWR(IOCTL_CODE, 11, struct ioctl_enumeration)
-#define IOCTL_SUSPEND_REASON     _IOWR(IOCTL_CODE, 12, struct ioctl_flag)
-#define IOCTL_READ_MEMORY        _IOWR(IOCTL_CODE, 20, struct ioctl_cpy)
-#define IOCTL_WRITE_MEMORY       _IOWR(IOCTL_CODE, 21, struct ioctl_cpy)
-#define IOCTL_READ_AUXV          _IOWR(IOCTL_CODE, 22, struct ioctl_cpy)
-#define IOCTL_READ_REGISTERS     _IOWR(IOCTL_CODE, 30, struct ioctl_cpy)
-#define IOCTL_WRITE_REGISTERS    _IOWR(IOCTL_CODE, 31, struct ioctl_cpy)
 
 /**
  * on_ioctl - handles an incoming IOCTL
