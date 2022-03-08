@@ -95,7 +95,7 @@ class commands:
 
 # Actual client
 class debugger:
-    # Constants (see types.h)
+    # Constants (see common.h)
     NOT_SUSPENDED          = 0
     SUSPEND_EXPLICIT       = 1
     SUSPEND_ON_BREAK       = 2
@@ -133,9 +133,17 @@ class debugger:
             raise KeyError("Unknown event ID: {}".format(evt["event"]))
         return evt
 
-    # Actual client commands
+    # Setup and wrapper functions for `with`
     def __init__(self):
         self.device = open("/dev/debugging")
+    def __enter__(self):
+        return self
+    def __exit__(self, exception_type, exception_value, traceback):
+        self.close()
+    def close(self):
+        self.device.close()
+
+    # Actual client commands
     def wait(self):
         buf_size = 256
         events = []
