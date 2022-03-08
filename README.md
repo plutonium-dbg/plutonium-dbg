@@ -102,10 +102,23 @@ Unfortunately, plutonium-dbg currently does not actually build with RHEL7'ish (e
 
 Contributions to plutonium-dbg are always welcome! If you encounter a bug or have a feature request, please [open an issue](https://github.com/plutonium-dbg/plutonium-dbg/issues/new). Feel free to create a [pull request](https://help.github.com/articles/creating-a-pull-request/) for your improvements.
 
+## See Also
+For the academic scope of this project, also see https://dl.acm.org/doi/abs/10.1145/3289595.3289596
+If you use it for your work, please cite:
+```
+@inproceedings{holl2018kernel,
+  title={Kernel-assisted debugging of linux applications},
+  author={Holl, Tobias and Klocke, Philipp and Franzen, Fabian and Kirsch, Julian},
+  booktitle={Proceedings of the 2nd Reversing and Offensive-oriented Trends Symposium},
+  pages={1--9},
+  year={2018}
+}
+```
+
 ## License
 
 plutonium-dbg, including the GDB server, is released under the GPLv2 (or, at your choice, any later version).
 
 ----
 
-<sup>© 2018 Tobias Holl (@TobiasHoll), Philipp Klocke (@KillPinguin)</sup>
+<sup>© 2018 Tobias Holl (@TobiasHoll), Philipp Klocke (@klockeph)</sup>
